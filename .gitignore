@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Business data (pricing / BOM / inventory) — kept local only
+mrp_current.csv
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Claude Code local settings
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
