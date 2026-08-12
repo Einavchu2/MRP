@@ -15,6 +15,7 @@ COLUMNS = [
     "item",
     "description",
     "supplier",
+    "procurement_rep",
     "planner_code",
     "request_type",
     "request_date",
@@ -30,7 +31,7 @@ STATUS_OPTIONS   = ["🟢 הושלם", "🟡 בטיפול", "🔴 טרם טופ�
 PRIORITY_OPTIONS = ["🔴 דחוף", "🟡 בינוני", "⚪ רגיל"]
 REQUEST_TYPES    = [
     "הקדמת הזמנה", "הגדלת הזמנה", "הקדמת אספקה", "אישור אספקה",
-    "בירור סטטוס", "עדכון PO", "אחר",
+    "בירור סטטוס", "עדכון PO", "חסר PD", "אחר",
 ]
 
 
@@ -65,6 +66,7 @@ def add_entry(
     item: str,
     description: str = "",
     supplier: str = "",
+    procurement_rep: str = "",
     planner_code: str = "",
     request_type: str = "",
     request_date: str = "",
@@ -81,6 +83,7 @@ def add_entry(
         "item":              str(item).strip(),
         "description":       str(description).strip(),
         "supplier":          str(supplier).strip(),
+        "procurement_rep":   str(procurement_rep).strip(),
         "planner_code":      str(planner_code).strip(),
         "request_type":      str(request_type).strip(),
         "request_date":      str(request_date).strip(),

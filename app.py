@@ -19,7 +19,10 @@ _ensure_packages()
 
 from src.db import load_full_bom, load_dwh_data, load_substitutes
 from src.data_prep import enrich_bom, build_mrp_pivot
-from src.simulation import SimulationConfig, run_simulation, _compute_inv_cover as _compute_inv_cover_orig
+from src.simulation import (
+    SimulationConfig, run_simulation, _compute_inv_cover as _compute_inv_cover_orig,
+    _sum_by_item as _sim_sum_by_item, _window_mean as _sim_window_mean,
+)
 from src.master_data import load_master, get_master_map
 from src.sku_tracking import (
     load_tracking as load_sku_tracking,
@@ -408,6 +411,11 @@ if st.session_state.app_mode == "Simulation" and not st.session_state.data_loade
 # ══════════════════════════════════════════════════════════════
 
 if st.session_state.app_mode == "SKU Tracking":
+    if st.button("⬅️ Back to MRP Simulation"):
+        with st.spinner("🔄 Loading MRP Simulation…"):
+            st.session_state.app_mode = "Simulation"
+            st.session_state.app_mode_pending = "Simulation"
+            st.rerun()
     st.title("🔎 SKU Procurement Tracking")
     st.caption("Track open procurement issues per SKU — status, priority, next follow-up date, supplier and running notes.")
 else:
@@ -422,17 +430,22 @@ if st.session_state.app_mode == "Simulation" and st.session_state.load_error:
     st.stop()
 
 if st.session_state.app_mode == "SKU Tracking":
-    tracking_df = load_sku_tracking()
+    with st.spinner("🔄 Loading SKU Tracking…"):
+        tracking_df = load_sku_tracking()
 
-    # ── Item picker sourced from master data (auto-fills description/planner) ──
-    _mm_track = getattr(st.session_state, "master_map", {}) or {}
-    _pivot_track = getattr(st.session_state, "pivot_df", None)
-    if _mm_track:
-        track_item_options = sorted(_mm_track.keys())
-    elif _pivot_track is not None:
-        track_item_options = sorted(_pivot_track["item"].dropna().unique().tolist())
-    else:
-        track_item_options = []
+        # ── Item picker sourced from master data (auto-fills description/planner) ──
+        _mm_track = getattr(st.session_state, "master_map", {}) or {}
+        _pivot_track = getattr(st.session_state, "pivot_df", None)
+        if _mm_track:
+            track_item_options = sorted(_mm_track.keys())
+        elif _pivot_track is not None:
+            track_item_options = sorted(_pivot_track["item"].dropna().unique().tolist())
+        else:
+            track_item_options = []
+
+    if not _mm_track and _pivot_track is None:
+        st.info("💡 Simulation data hasn't been loaded yet, so the SKU picker will use free-text entry. "
+                 "Switch to **Simulation** mode once to enable auto-fill of description/planner code.")
 
     st.subheader("➕ Open a new tracking item")
     # SKU picker lives outside the form so description/planner auto-fill live when it changes.
@@ -451,6 +464,7 @@ if st.session_state.app_mode == "SKU Tracking":
         with fc1:
             new_description = st.text_input("תיאור · Description", value=desc_default)
             new_supplier = st.text_input("ספק · Supplier", value="")
+            new_procurement_rep = st.text_input("נציג רכש · Procurement rep", value="")
             new_planner = st.text_input("פלנר · Planner code", value=str(mp.get("planner_code", "")))
         with fc2:
             new_request_type = st.selectbox("סוג הבקשה · Request type", SKU_REQUEST_TYPES)
@@ -469,6 +483,7 @@ if st.session_state.app_mode == "SKU Tracking":
                 item=new_item,
                 description=new_description,
                 supplier=new_supplier,
+                procurement_rep=new_procurement_rep,
                 planner_code=new_planner,
                 request_type=new_request_type,
                 request_date=str(new_request_date),
@@ -521,7 +536,7 @@ if st.session_state.app_mode == "SKU Tracking":
             if "בינוני" in str(v): return "background-color:#fef9c3;color:#713f12"
             return ""
 
-        display_cols = ["item","description","supplier","planner_code","request_type",
+        display_cols = ["item","description","supplier","procurement_rep","planner_code","request_type",
                          "request_date","next_action_date","priority","status","update_notes","owner"]
         st.dataframe(
             view_df[display_cols].style.map(_status_color, subset=["status"]).map(_priority_color, subset=["priority"]),
@@ -537,6 +552,7 @@ if st.session_state.app_mode == "SKU Tracking":
                 "item":             st.column_config.TextColumn("מק\"ט"),
                 "description":      st.column_config.TextColumn("תיאור", width="medium"),
                 "supplier":         st.column_config.TextColumn("ספק"),
+                "procurement_rep":  st.column_config.TextColumn("נציג רכש"),
                 "planner_code":     st.column_config.TextColumn("פלנר"),
                 "request_type":     st.column_config.SelectboxColumn("סוג הבקשה", options=SKU_REQUEST_TYPES),
                 "request_date":     st.column_config.TextColumn("תאריך פנייה"),
@@ -579,12 +595,20 @@ if st.session_state.app_mode == "SKU Tracking":
 
 with st.sidebar:
     st.header("⚙️ Application Settings")
-    app_mode = st.selectbox(
+    _mode_options = ["Simulation", "SKU Tracking"]
+    pending_mode = st.selectbox(
         "App Mode",
-        ["Simulation", "SKU Tracking"],
-        index=["Simulation", "SKU Tracking"].index(st.session_state.app_mode or "Simulation"),
+        _mode_options,
+        index=_mode_options.index(st.session_state.app_mode or "Simulation"),
+        key="app_mode_pending",
     )
-    st.session_state.app_mode = app_mode
+    mode_changed = pending_mode != (st.session_state.app_mode or "Simulation")
+    if st.button("✅ Apply", key="apply_app_mode", disabled=not mode_changed, use_container_width=True):
+        with st.spinner(f"🔄 Loading {pending_mode}…"):
+            st.session_state.app_mode = pending_mode
+            st.rerun()
+    if mode_changed:
+        st.caption(f"⚠️ Click **Apply** to switch to **{pending_mode}**.")
     st.divider()
 
     # ── Substitute Items Info ──────────────────────────────────
@@ -758,7 +782,51 @@ def inject_master_rows(df: pd.DataFrame, master_map: dict) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=10)
-def render_pivot_html(df, month_cols, changed_items=None, master_map_key=None, lt_markers=None, sub_items=None):
+def _build_cover_tooltips(pivot_df: pd.DataFrame, month_cols: tuple) -> dict:
+    """
+    Precompute a hover-only breakdown for each (item, month) COVER_MONTHS /
+    COVER_MONTHS_UPDATED cell: INV ÷ average forecast over the next 7 months.
+    Reuses the exact same helpers _compute_inv_cover() uses, so the numbers
+    shown always match what's actually displayed.
+    """
+    month_cols = list(month_cols)
+    if pivot_df is None or pivot_df.empty or not month_cols:
+        return {}
+    order_type = pivot_df["ORDER_TYPE_FINAL"].astype(str)
+    is_fcst = order_type.str.contains("forecast", case=False, na=False)
+    is_inv  = order_type == "INV"
+    fcst_by_item = _sim_sum_by_item(pivot_df, is_fcst, month_cols)
+    inv_by_item  = _sim_sum_by_item(pivot_df, is_inv,  month_cols)
+
+    tooltips = {}
+    for item, fcst_raw in fcst_by_item.items():
+        inv_arr = inv_by_item.get(item)
+        if inv_arr is None:
+            continue
+        fcst_arr = pd.Series(fcst_raw).clip(lower=0).ffill().fillna(0).to_numpy(dtype=float)
+        for i, m in enumerate(month_cols):
+            inv_val = inv_arr[i]
+            if pd.isna(inv_val):
+                continue
+            window = fcst_arr[i:i+7]
+            avg = _sim_window_mean(window)
+            if not avg or avg <= 0 or pd.isna(avg):
+                continue
+            cover = inv_val / avg
+            window_months = month_cols[i:i+len(window)]
+            vals_txt = ", ".join(f"{v:,.1f}" for v in window)
+            tooltips[(item, m)] = (
+                f"COVER = INV ÷ avg Forecast (next {len(window)}mo)\n"
+                f"INV({m}) = {inv_val:,.2f}\n"
+                f"Forecast {window_months[0]}→{window_months[-1]}: {vals_txt}\n"
+                f"avg = {avg:,.2f}\n"
+                f"= {inv_val:,.2f} ÷ {avg:,.2f} = {cover:,.2f} mo"
+            )
+    return tooltips
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=10)
+def render_pivot_html(df, month_cols, changed_items=None, master_map_key=None, lt_markers=None, sub_items=None, cover_tooltips=None):
     """
     Lean HTML pivot renderer — uses CSS classes (not inline styles) for sticky
     columns so the browser only computes sticky layout once per class, not
@@ -770,6 +838,9 @@ def render_pivot_html(df, month_cols, changed_items=None, master_map_key=None, l
     # sub_items: dict {sub_sku: main_sku} for highlighting substitute On Hand rows
     if isinstance(sub_items, frozenset): sub_items = dict(sub_items)
     sub_items = sub_items or {}
+    # cover_tooltips: {(item, month): "hover breakdown text"} for COVER_MONTHS cells
+    if isinstance(cover_tooltips, frozenset): cover_tooltips = dict(cover_tooltips)
+    cover_tooltips = cover_tooltips or {}
     # master_map_key is a frozenset of tuples (item, ss) for cache stability
     _ss_map = dict(master_map_key) if master_map_key else {}
     # lt_markers: frozenset of (item, lt_col) — which column is the LT boundary per item
@@ -871,22 +942,29 @@ def render_pivot_html(df, month_cols, changed_items=None, master_map_key=None, l
                 else:
                     cells.append('<td class="v"></td>')
         else:
+            is_cover_type = otype in ("COVER_MONTHS", "COVER_MONTHS_UPDATED")
             for c in cols:
                 val = row.get(c)
                 try:
                     fval = float(val)
                     if pd.isna(fval):
                         cells.append('<td class="v">–</td>')
-                    elif otype == "COVER_MONTHS" and fval < float(_ss_map.get(item, 7)):
-                        cells.append(f'<td class="v alert-cov">{fval:,.1f}</td>')
+                        continue
+                    tattr = ""
+                    if is_cover_type:
+                        tip = cover_tooltips.get((item, c), "")
+                        if tip:
+                            tattr = f' title="{tip}"'
+                    if otype == "COVER_MONTHS" and fval < float(_ss_map.get(item, 7)):
+                        cells.append(f'<td class="v alert-cov"{tattr}>{fval:,.1f}</td>')
                     elif otype == "COVER_MONTHS_UPDATED" and fval < float(_ss_map.get(item, 7)):
-                        cells.append(f'<td class="v alert-covu">{fval:,.1f}</td>')
+                        cells.append(f'<td class="v alert-covu"{tattr}>{fval:,.1f}</td>')
                     elif otype == "PO_RECOMMENDATION" and fval > 0:
                         cells.append(f'<td class="v alert-po">{fval:,.0f}</td>')
                     elif otype == "PO_EXCEPTION" and fval > 0:
                         cells.append(f'<td class="v alert-exc">⚠️ {fval:,.0f}</td>')
                     else:
-                        cells.append(f'<td class="v">{fval:,.1f}</td>')
+                        cells.append(f'<td class="v"{tattr}>{fval:,.1f}</td>')
                 except (TypeError, ValueError):
                     cells.append('<td class="v">–</td>')
 
@@ -930,6 +1008,8 @@ th,td{{padding:0}}
 /* Value cells */
 .v{{padding:4px 8px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;width:75px;min-width:75px;
    background:inherit}}
+/* Subtle hint that a cell has a calculation breakdown on hover — only cells with a title attr */
+td.v[title]{{cursor:help;border-bottom:1px dotted #94a3b8}}
 
 /* Row background colors — applied once per <tr>, inherited by sticky cells via background:inherit */
 tr{{background:#fff}}
@@ -1181,11 +1261,14 @@ with tab_sim:
         n_rows = len(page_view)
         h = min(680, max(280, n_rows * 29 + 40))
         _ss_key = frozenset((str(k), float(v.get("safety_stock", 7))) for k, v in _mm_rend.items())
+        _cover_tips = _build_cover_tooltips(updated_pivot, tuple(all_month_cols))
         _comp.html(
             render_pivot_html(page_view, tuple(sorted(month_display)), frozenset(changed_items or set()), master_map_key=_ss_key,
-                              sub_items=frozenset((k,v) for k,v in (getattr(st.session_state,"sub_items_map",{}) or {}).items())),
+                              sub_items=frozenset((k,v) for k,v in (getattr(st.session_state,"sub_items_map",{}) or {}).items()),
+                              cover_tooltips=frozenset(_cover_tips.items())),
             height=h, scrolling=True,
         )
+        st.caption("💡 Hover any **Cover (mo)** value to see how it was calculated.")
 
         legend_parts = ["🔴 COVER < SS months", "🟠 PO Recommendation", "🔴⚠️ PO Exception (cover < 80% SS)", "🔵 Coverage Updated (post-PO)"]
         if changed_items: legend_parts.append("🟡 Updated by simulation")
@@ -1218,15 +1301,20 @@ with tab_sim:
                     if fcst_row.empty and act_row.empty:
                         st.info("No Forecast/Actual rows found for this SKU.")
                     else:
-                        f_vals = (pd.to_numeric(fcst_row[chart_months].iloc[0], errors="coerce")
+                        # Sum across rows (an item can have more than one Forecast/Actual row)
+                        # instead of taking iloc[0], which silently dropped data for such SKUs.
+                        f_vals = (fcst_row[chart_months].apply(pd.to_numeric, errors="coerce").sum(axis=0, min_count=1)
                                   if not fcst_row.empty else pd.Series([np.nan]*len(chart_months), index=chart_months))
-                        a_vals = (pd.to_numeric(act_row[chart_months].iloc[0], errors="coerce")
+                        a_vals = (act_row[chart_months].apply(pd.to_numeric, errors="coerce").sum(axis=0, min_count=1)
                                   if not act_row.empty else pd.Series([np.nan]*len(chart_months), index=chart_months))
 
                         fig_fa = _go.Figure()
                         fig_fa.add_trace(_go.Bar(x=chart_months, y=a_vals.values, name="Actual", marker_color="#3b82f6"))
                         fig_fa.add_trace(_go.Scatter(x=chart_months, y=f_vals.values, name="Forecast",
-                                                      mode="lines+markers", line=dict(color="#f97316", width=2)))
+                                                      mode="lines+markers", line=dict(color="#f97316", width=2),
+                                                      connectgaps=True))
+                        st.caption("ℹ️ Forecast is often entered for a few months at a time — the line connects across "
+                                   "months with no entry so the trend stays readable; markers show months with real data.")
                         fig_fa.update_layout(
                             title=f"{sel_chart_item} — {desc_s}",
                             height=380, xaxis_title="Month", yaxis_title="Qty",

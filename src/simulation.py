@@ -352,8 +352,25 @@ _DEFAULT_LT     = 3
 _DEFAULT_SL     = 24
 
 
+def _window_mean(arr: np.ndarray) -> float:
+    """Mirrors pandas' `series[window].fillna(0).mean()`: NaN only for an empty window."""
+    return float(arr.mean()) if arr.size > 0 else np.nan
+
+
+def _sum_by_item(pivot: pd.DataFrame, mask: pd.Series, month_cols: list) -> dict:
+    """Numeric-sum the given rows per item, once, instead of per-material full-table scans."""
+    sub = pivot.loc[mask, ["item"] + month_cols]
+    if sub.empty:
+        return {}
+    sub = sub.copy()
+    sub[month_cols] = sub[month_cols].apply(pd.to_numeric, errors="coerce")
+    grouped = sub.groupby("item")[month_cols].sum(min_count=1)
+    return {item: row.to_numpy(dtype=float) for item, row in grouped.iterrows()}
+
+
 def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataFrame:
     month_cols = sorted([c for c in pivot.columns if str(c).startswith("202")])
+    n_months   = len(month_cols)
 
     if master_map is None and _MASTER_LOADED:
         try:
@@ -368,6 +385,17 @@ def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataF
 
     new_rows = []
 
+    # ── Pre-group rows by item ONCE (was: 3 full-table rescans per material) ──
+    order_type = pivot["ORDER_TYPE_FINAL"]
+    is_fcst    = order_type.str.contains("forecast", case=False, na=False)
+    is_po      = order_type.isin(["Purchase order"])
+    is_onhand  = (order_type.str.contains("on hand|onhand", case=False, na=False) |
+                  (order_type == "3.On Hand"))
+
+    fcst_by_item   = _sum_by_item(pivot, is_fcst,   month_cols)
+    po_by_item     = _sum_by_item(pivot, is_po,     month_cols)
+    onhand_by_item = _sum_by_item(pivot, is_onhand, month_cols)
+
     for material in pivot["item"].dropna().unique():
         m_data     = master_map.get(str(material), {})
         ss         = float(m_data.get("safety_stock",  _DEFAULT_SS))
@@ -375,68 +403,61 @@ def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataF
         lead_time  = float(m_data.get("lead_time",     _DEFAULT_LT))
         shelf_life = float(m_data.get("shelf_life",    _DEFAULT_SL))
 
-        fcst_mask   = (pivot["item"]==material) & pivot["ORDER_TYPE_FINAL"].str.contains("forecast", case=False, na=False)
-        po_mask     = (pivot["item"]==material) & pivot["ORDER_TYPE_FINAL"].isin(["Purchase order"])
-        onhand_mask = (pivot["item"]==material) & (
-            pivot["ORDER_TYPE_FINAL"].str.contains("on hand|onhand", case=False, na=False) |
-            (pivot["ORDER_TYPE_FINAL"]=="3.On Hand"))
+        forecast_raw = fcst_by_item.get(material)
+        po_raw       = po_by_item.get(material)
+        onhand_raw   = onhand_by_item.get(material)
 
-        fcst_row   = pivot.loc[fcst_mask]
-        po_row     = pivot.loc[po_mask]
-        onhand_row = pivot.loc[onhand_mask]
-
-        if fcst_row.empty and po_row.empty and onhand_row.empty:
+        if forecast_raw is None and po_raw is None and onhand_raw is None:
             continue
 
         inv_row    = {"item":material,"ORDER_TYPE_FINAL":"INV"}
         cover_row  = {"item":material,"ORDER_TYPE_FINAL":"COVER_MONTHS"}
         po_rec_row = {"item":material,"ORDER_TYPE_FINAL":"PO_RECOMMENDATION"}
 
-        zero_s = pd.Series(0.0, index=month_cols)
+        if forecast_raw is None:
+            forecast_raw = np.full(n_months, np.nan)
+        # clip(lower=0).ffill().fillna(0) — tiny (n_months long), pandas is fine here
+        forecast_arr = pd.Series(forecast_raw).clip(lower=0).ffill().fillna(0).to_numpy(dtype=float)
+        po_arr       = np.nan_to_num(po_raw,     nan=0.0) if po_raw     is not None else np.zeros(n_months)
+        onhand_arr   = np.nan_to_num(onhand_raw, nan=0.0) if onhand_raw is not None else np.zeros(n_months)
 
-        forecast_raw = fcst_row[month_cols].apply(pd.to_numeric,errors="coerce").sum(axis=0,min_count=1) if not fcst_row.empty else pd.Series(np.nan,index=month_cols)
-        forecast_series = forecast_raw.clip(lower=0).ffill().fillna(0)
-        po_series       = pd.to_numeric(po_row[month_cols].sum(axis=0),errors="coerce").fillna(0) if not po_row.empty else zero_s.copy()
-        onhand_series   = pd.to_numeric(onhand_row[month_cols].sum(axis=0),errors="coerce").fillna(0) if not onhand_row.empty else zero_s.copy()
-
-        first_oh = next((m for m in month_cols if onhand_series[m]>0), None)
-        if first_oh is None: continue
+        first_oh_idx = next((i for i in range(n_months) if onhand_arr[i] > 0), None)
+        if first_oh_idx is None: continue
+        first_oh = month_cols[first_oh_idx]
 
         started = False
         running_inventory = 0.0
-        inv_values = {}
-        cover_values = {}
+        inv_arr   = np.full(n_months, np.nan)
+        cover_arr = np.full(n_months, np.nan)
 
-        for i,m in enumerate(month_cols):
+        for i, m in enumerate(month_cols):
             if not started:
                 if m==first_oh: started=True
                 else:
                     inv_row[m]=cover_row[m]=po_rec_row[m]=np.nan
                     continue
-            running_inventory = running_inventory + po_series[m] - forecast_series[m]
-            if m==first_oh: running_inventory = onhand_series[m] + po_series[m] - forecast_series[m]
+            running_inventory = running_inventory + po_arr[i] - forecast_arr[i]
+            if m==first_oh: running_inventory = onhand_arr[i] + po_arr[i] - forecast_arr[i]
             inv_row[m] = running_inventory
-            inv_values[m] = running_inventory
-            future_months = month_cols[i:i+7]
-            future_avg = forecast_series[future_months].fillna(0).mean()
+            inv_arr[i] = running_inventory
+            future_avg = _window_mean(forecast_arr[i:i+7])
             cover = running_inventory/future_avg if future_avg>0 else np.nan
             cover_row[m] = cover
-            cover_values[m] = cover
+            cover_arr[i] = cover
 
-        running_inv_sim  = dict(inv_values)
-        running_cov_sim  = dict(cover_values)
+        running_inv_sim = inv_arr.copy()
+        running_cov_sim = cover_arr.copy()
         for m in month_cols: po_rec_row[m] = np.nan
 
         i = 0
-        while i < len(month_cols):
+        while i < n_months:
             m = month_cols[i]
-            inv   = running_inv_sim.get(m)
-            cover = running_cov_sim.get(m)
-            if inv is None or cover is None or np.isnan(inv) or np.isnan(cover):
+            inv   = running_inv_sim[i]
+            cover = running_cov_sim[i]
+            if np.isnan(inv) or np.isnan(cover):
                 i+=1; continue
             if cover < ss:
-                future_months = month_cols[i:i+int(target_cov)]
-                future_avg    = forecast_series[future_months].fillna(0).mean()
+                future_avg    = _window_mean(forecast_arr[i:i+int(target_cov)])
                 target_inv    = target_cov * future_avg
                 sl_cap        = shelf_life * future_avg if future_avg>0 else np.inf
                 target_inv    = min(target_inv, sl_cap)
@@ -447,12 +468,11 @@ def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataF
                     if pd.isna(po_rec_row.get(po_month, np.nan)):
                         po_rec_row[po_month] = po_qty
                     new_inv = inv + po_qty
-                    for j in range(i, len(month_cols)):
-                        mj = month_cols[j]
-                        new_inv = (inv + po_qty - forecast_series.get(mj,0)) if j==i else (new_inv + po_series.get(mj,0) - forecast_series.get(mj,0))
-                        running_inv_sim[mj] = new_inv
-                        avg_f = forecast_series[month_cols[j:j+7]].fillna(0).mean()
-                        running_cov_sim[mj] = new_inv/avg_f if avg_f>0 else np.nan
+                    for j in range(i, n_months):
+                        new_inv = (inv + po_qty - forecast_arr[j]) if j==i else (new_inv + po_arr[j] - forecast_arr[j])
+                        running_inv_sim[j] = new_inv
+                        avg_f = _window_mean(forecast_arr[j:j+7])
+                        running_cov_sim[j] = new_inv/avg_f if avg_f>0 else np.nan
             i+=1
 
         new_rows.extend([inv_row, cover_row, po_rec_row])
