@@ -21,12 +21,13 @@ from src.db import load_full_bom, load_dwh_data, load_substitutes
 from src.data_prep import enrich_bom, build_mrp_pivot
 from src.simulation import SimulationConfig, run_simulation, _compute_inv_cover as _compute_inv_cover_orig
 from src.master_data import load_master, get_master_map
-from src.batch_tracking import (
-    BATCH_HISTORY_FILE,
-    load_batch_history,
-    add_batch_event,
-    get_batch_trace,
-    summarize_batches,
+from src.sku_tracking import (
+    load_tracking as load_sku_tracking,
+    save_tracking as save_sku_tracking,
+    add_entry as add_sku_tracking_entry,
+    STATUS_OPTIONS as SKU_STATUS_OPTIONS,
+    PRIORITY_OPTIONS as SKU_PRIORITY_OPTIONS,
+    REQUEST_TYPES as SKU_REQUEST_TYPES,
 )
 
 def _apply_substitutes(pivot_df: pd.DataFrame, sub_df: pd.DataFrame) -> pd.DataFrame:
@@ -406,9 +407,9 @@ if st.session_state.app_mode == "Simulation" and not st.session_state.data_loade
 # HEADER
 # ══════════════════════════════════════════════════════════════
 
-if st.session_state.app_mode == "Batch Tracking":
-    st.title("🚚 Batch Tracking")
-    st.caption("Track batch progress from production through release and shipment.")
+if st.session_state.app_mode == "SKU Tracking":
+    st.title("🔎 SKU Procurement Tracking")
+    st.caption("Track open procurement issues per SKU — status, priority, next follow-up date, supplier and running notes.")
 else:
     st.title("🏭 MRP / BOM Simulation Engine")
     st.caption("Supply Chain · What-If Analysis")
@@ -420,87 +421,155 @@ if st.session_state.app_mode == "Simulation" and st.session_state.load_error:
         st.rerun()
     st.stop()
 
-if st.session_state.app_mode == "Batch Tracking":
-    history_df = load_batch_history()
-    summary_df = summarize_batches(history_df)
+if st.session_state.app_mode == "SKU Tracking":
+    tracking_df = load_sku_tracking()
 
-    st.subheader("📦 Create a new batch")
-    with st.form("create_batch_form"):
-        new_batch_id = st.text_input("Batch ID", value="")
-        new_product = st.text_input("Product SKU", value="")
-        new_batch_qty = st.number_input("Batch quantity", min_value=0.0, value=0.0, step=1.0)
-        new_production_date = st.date_input("Production date", value=pd.Timestamp.now().date())
-        new_location = st.text_input("Production location", value="Production")
-        new_user = st.text_input("Created by", value="planner")
-        new_notes = st.text_area("Notes", value="", height=100)
-        create_clicked = st.form_submit_button("Create batch")
+    # ── Item picker sourced from master data (auto-fills description/planner) ──
+    _mm_track = getattr(st.session_state, "master_map", {}) or {}
+    _pivot_track = getattr(st.session_state, "pivot_df", None)
+    if _mm_track:
+        track_item_options = sorted(_mm_track.keys())
+    elif _pivot_track is not None:
+        track_item_options = sorted(_pivot_track["item"].dropna().unique().tolist())
+    else:
+        track_item_options = []
+
+    st.subheader("➕ Open a new tracking item")
+    # SKU picker lives outside the form so description/planner auto-fill live when it changes.
+    if track_item_options:
+        new_item = st.selectbox("מק\"ט · SKU", options=track_item_options, key="new_track_item")
+    else:
+        new_item = st.text_input("מק\"ט · SKU", value="", key="new_track_item")
+    mp = _mm_track.get(str(new_item), {}) if new_item else {}
+    desc_default = ""
+    if new_item and _pivot_track is not None:
+        _d = _pivot_track[_pivot_track["item"] == new_item]["description"].dropna()
+        desc_default = _d.iloc[0] if not _d.empty else ""
+
+    with st.form("create_sku_tracking_form"):
+        fc1, fc2 = st.columns([2, 2])
+        with fc1:
+            new_description = st.text_input("תיאור · Description", value=desc_default)
+            new_supplier = st.text_input("ספק · Supplier", value="")
+            new_planner = st.text_input("פלנר · Planner code", value=str(mp.get("planner_code", "")))
+        with fc2:
+            new_request_type = st.selectbox("סוג הבקשה · Request type", SKU_REQUEST_TYPES)
+            new_request_date = st.date_input("תאריך פנייה · Request date", value=pd.Timestamp.now().date())
+            new_next_action = st.date_input("מועד הבא לטיפול · Next follow-up date", value=pd.Timestamp.now().date())
+            new_priority = st.selectbox("תעדוף · Priority", SKU_PRIORITY_OPTIONS)
+        new_owner = st.text_input("אחראי · Owner", value="")
+        new_notes = st.text_area("עדכון · Update / notes", value="", height=80)
+        create_clicked = st.form_submit_button("➕ Add tracking item")
 
     if create_clicked:
-        if not new_batch_id or not new_product:
-            st.error("Batch ID and Product SKU are required to create a batch.")
+        if not new_item:
+            st.error("SKU is required.")
         else:
-            history_df = add_batch_event(
-                batch_id=new_batch_id,
-                product=new_product,
-                batch_qty=new_batch_qty,
-                production_date=str(new_production_date),
-                step="Production",
-                status="Produced",
-                from_location="",
-                to_location=new_location,
-                notes=new_notes,
-                user=new_user,
+            add_sku_tracking_entry(
+                item=new_item,
+                description=new_description,
+                supplier=new_supplier,
+                planner_code=new_planner,
+                request_type=new_request_type,
+                request_date=str(new_request_date),
+                next_action_date=str(new_next_action),
+                priority=new_priority,
+                status="🔴 טרם טופל",
+                update_notes=new_notes,
+                owner=new_owner,
             )
-            summary_df = summarize_batches(history_df)
-            st.success(f"✅ Batch {new_batch_id} created and production event recorded.")
+            st.success(f"✅ Tracking item added for {new_item}.")
+            st.rerun()
 
     st.markdown("---")
-    st.subheader("🚀 Log a supply chain step")
-    batch_options = list(history_df["batch_id"].dropna().unique())
-    selected_batch = st.selectbox("Batch ID", batch_options if batch_options else [""], index=0 if batch_options else 0)
-    selected_step = st.selectbox(
-        "Step",
-        ["Quality release", "Warehouse release", "Shipment", "Delivery", "Release to market", "Other"],
-    )
-    selected_status = st.selectbox(
-        "Status",
-        ["Released", "Shipped", "Delivered", "On hold", "Cancelled", "In transit"],
-    )
-    from_location = st.text_input("From location", value="")
-    to_location = st.text_input("To location", value="")
-    event_notes = st.text_area("Notes", value="", height=100)
-    event_user = st.text_input("Recorded by", value="planner")
-    if st.button("Log step"):
-        if not selected_batch:
-            st.error("Select a batch before logging a step.")
-        else:
-            history_df = add_batch_event(
-                batch_id=selected_batch,
-                product=history_df.loc[history_df["batch_id"] == selected_batch, "product"].iloc[0] if selected_batch in history_df["batch_id"].values else "",
-                batch_qty=float(history_df.loc[history_df["batch_id"] == selected_batch, "batch_qty"].iloc[0]) if selected_batch in history_df["batch_id"].values else 0.0,
-                production_date=str(history_df.loc[history_df["batch_id"] == selected_batch, "production_date"].iloc[0].date()) if selected_batch in history_df["batch_id"].values else "",
-                step=selected_step,
-                status=selected_status,
-                from_location=from_location,
-                to_location=to_location,
-                notes=event_notes,
-                user=event_user,
-            )
-            summary_df = summarize_batches(history_df)
-            st.success(f"✅ Logged {selected_step} for batch {selected_batch}.")
+    st.subheader("📋 Tracking table")
+    tracking_df = load_sku_tracking()
 
-    st.markdown("---")
-    st.subheader("🧾 Batch history")
-    if history_df.empty:
-        st.info("No batch events have been recorded yet.")
+    if tracking_df.empty:
+        st.info("No SKU tracking items yet — add one above.")
     else:
-        trace_id = st.selectbox("Trace batch", batch_options if batch_options else [""], index=0 if batch_options else 0)
-        if trace_id:
-            trace_df = get_batch_trace(trace_id, history_df)
-            st.dataframe(trace_df.reset_index(drop=True), use_container_width=True)
+        n_open     = int((tracking_df["status"] == "🔴 טרם טופל").sum())
+        n_progress = int((tracking_df["status"] == "🟡 בטיפול").sum())
+        n_done     = int((tracking_df["status"] == "🟢 הושלם").sum())
+        k1, k2, k3 = st.columns(3)
+        k1.metric("🔴 טרם טופל", n_open)
+        k2.metric("🟡 בטיפול", n_progress)
+        k3.metric("🟢 הושלם", n_done)
 
-        with st.expander("Batch summary", expanded=True):
-            st.dataframe(summary_df.reset_index(drop=True), use_container_width=True)
+        # ── Filters (for the read-only colored view below) ──────────
+        tf1, tf2, tf3 = st.columns(3)
+        with tf1:
+            status_filter = st.multiselect("Filter by status", SKU_STATUS_OPTIONS, default=[])
+        with tf2:
+            planner_opts = sorted([p for p in tracking_df["planner_code"].unique().tolist() if p])
+            planner_filter = st.multiselect("Filter by planner code", planner_opts, default=[])
+        with tf3:
+            item_filter = st.multiselect("Filter by SKU", sorted(tracking_df["item"].unique().tolist()), default=[])
+
+        view_df = tracking_df.copy()
+        if status_filter:  view_df = view_df[view_df["status"].isin(status_filter)]
+        if planner_filter: view_df = view_df[view_df["planner_code"].isin(planner_filter)]
+        if item_filter:    view_df = view_df[view_df["item"].isin(item_filter)]
+
+        def _status_color(v):
+            if "הושלם" in str(v):    return "background-color:#dcfce7;color:#14532d;font-weight:600"
+            if "בטיפול" in str(v):   return "background-color:#fef9c3;color:#713f12;font-weight:600"
+            if "טרם טופל" in str(v): return "background-color:#fee2e2;color:#991b1b;font-weight:600"
+            return ""
+        def _priority_color(v):
+            if "דחוף" in str(v):   return "background-color:#fee2e2;color:#991b1b;font-weight:600"
+            if "בינוני" in str(v): return "background-color:#fef9c3;color:#713f12"
+            return ""
+
+        display_cols = ["item","description","supplier","planner_code","request_type",
+                         "request_date","next_action_date","priority","status","update_notes","owner"]
+        st.dataframe(
+            view_df[display_cols].style.map(_status_color, subset=["status"]).map(_priority_color, subset=["priority"]),
+            use_container_width=True, height=min(500, max(120, len(view_df) * 38 + 40)),
+        )
+
+        st.markdown("---")
+        st.subheader("✏️ Edit / add / remove rows")
+        st.caption("Edit any cell, add rows at the bottom, or select a row and press delete. Click **💾 Save changes** to persist.")
+        edited_df = st.data_editor(
+            tracking_df[display_cols],
+            column_config={
+                "item":             st.column_config.TextColumn("מק\"ט"),
+                "description":      st.column_config.TextColumn("תיאור", width="medium"),
+                "supplier":         st.column_config.TextColumn("ספק"),
+                "planner_code":     st.column_config.TextColumn("פלנר"),
+                "request_type":     st.column_config.SelectboxColumn("סוג הבקשה", options=SKU_REQUEST_TYPES),
+                "request_date":     st.column_config.TextColumn("תאריך פנייה"),
+                "next_action_date": st.column_config.TextColumn("מועד הבא לטיפול"),
+                "priority":         st.column_config.SelectboxColumn("תעדוף", options=SKU_PRIORITY_OPTIONS),
+                "status":           st.column_config.SelectboxColumn("סטטוס רכש", options=SKU_STATUS_OPTIONS),
+                "update_notes":     st.column_config.TextColumn("עדכון", width="large"),
+                "owner":            st.column_config.TextColumn("אחראי"),
+            },
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            key="sku_tracking_editor",
+            height=min(600, max(200, len(tracking_df) * 38 + 60)),
+        )
+
+        if st.button("💾 Save changes"):
+            import uuid as _uuid
+            to_save = edited_df.copy().reset_index(drop=True)
+            # Preserve stable ids for rows that already existed (by position); new/reordered
+            # rows get a fresh id — fine for this lightweight tracker (no cross-table joins on id).
+            ids = [tracking_df["id"].iloc[i] if i < len(tracking_df) else _uuid.uuid4().hex[:10] for i in range(len(to_save))]
+            to_save["id"] = ids
+            to_save["last_updated"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_sku_tracking(to_save)
+            st.success("✅ Saved.")
+            st.rerun()
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            tracking_df.to_excel(w, index=False)
+        st.download_button("📥 Download tracking table", data=buf.getvalue(), file_name="sku_tracking.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.stop()
 
@@ -512,8 +581,8 @@ with st.sidebar:
     st.header("⚙️ Application Settings")
     app_mode = st.selectbox(
         "App Mode",
-        ["Simulation", "Batch Tracking"],
-        index=["Simulation", "Batch Tracking"].index(st.session_state.app_mode or "Simulation"),
+        ["Simulation", "SKU Tracking"],
+        index=["Simulation", "SKU Tracking"].index(st.session_state.app_mode or "Simulation"),
     )
     st.session_state.app_mode = app_mode
     st.divider()
