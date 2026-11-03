@@ -51,6 +51,27 @@ def substitutes():
     return queries.get_substitutes()
 
 
+# ── RM analysis (src/rm_analysis.py) ───────────────────────────────
+
+@app.get("/rm/bom")
+def rm_bom():
+    return queries.get_rm_bom()
+
+
+@app.get("/rm/plan")
+def rm_plan():
+    return queries.get_rm_plan()
+
+
+@app.get("/rm/items")
+def rm_items(items: str):
+    """items = comma-separated item codes."""
+    try:
+        return queries.get_rm_items(tuple(sorted(set(items.split(",")))))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ── SKU Procurement Tracking (SQLite) ──────────────────────────────
 
 @app.get("/sku-tracking")

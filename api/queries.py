@@ -6,6 +6,8 @@ earlier this session) — the only real change is a pooled SQLAlchemy engine
 instead of a fresh pyodbc.connect() per call, and results going out as
 JSON-safe records instead of DataFrames.
 """
+import re
+
 import pandas as pd
 
 from .cache import ttl_cache
@@ -245,3 +247,108 @@ def get_substitutes() -> list:
         return _df_to_records(df)
     except Exception:
         return []
+
+
+# ── RM ANALYSIS (src/rm_analysis.py) ────────────────────────────────
+# Raw inputs only; classification, requirement, prices and the stock
+# position are all computed in src/rm_analysis.py.
+
+_ITEM_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+
+
+def _in_list(items) -> str:
+    """Literal IN-list for item codes — validated, since they arrive from the
+    query string and pyodbc caps bound parameters at 2,100."""
+    items = sorted({str(i).strip() for i in items if str(i).strip()})
+    bad = [i for i in items if not _ITEM_RE.match(i)]
+    if bad:
+        raise ValueError(f"Invalid item codes: {bad[:5]}")
+    return ",".join(f"'{i}'" for i in items) or "''"
+
+
+@ttl_cache(300)
+def get_rm_bom() -> list:
+    """Every Indented_Bills edge, with the columns the RM analysis needs
+    (ITEM_TYPE, batch size PQ, vendor) that the simulation's BOM query omits."""
+    df = pd.read_sql(
+        """SELECT DISTINCT PRODUCT, FORMULA_DESC1, FORMULA_VERS, INGREDIENT, INGREDIENT_DESCRIPTION,
+                  ITEM_TYPE, ING_UOM, TRY_CAST(ING_QTY AS FLOAT) AS ING_QTY,
+                  TRY_CAST(PRUDUCT_QTY AS FLOAT) AS PQ, PRODUCT_UOM, ASL_VENDOR_NAME
+           FROM Indented_Bills""",
+        get_dwh_engine(),
+    )
+    for c in ("PRODUCT", "INGREDIENT"):
+        df[c] = df[c].astype(str).str.strip()
+    return _df_to_records(df)
+
+
+@ttl_cache(300)
+def get_rm_plan() -> dict:
+    """Production plan and history for the whole site:
+      supply   ASCP EM work orders + planned orders (all items) — the forward
+               plan, and Order_Number -> parent item for RM demand rows
+      wip3y    actual ingredient consumption per formula and item, last 3
+               years (WIP_Last_3_Years, one row per batch/item/line)"""
+    engine = get_dwh_engine()
+    supply = pd.read_sql(
+        "SELECT ITEM, ORDER_TYPE_TEXT, Order_Number, QUANTITY, NEW_DUE_DATE FROM ASCPDemandSupplyBI "
+        "WHERE ORGANIZATION = 'EM' AND ORDER_TYPE_TEXT IN ('Planned order', 'Work order')",
+        engine,
+    )
+    wip = pd.read_sql(
+        """SELECT FORMULA_NO, ITEM, SUM(ACTUAL_QTY) AS ACTUAL_QTY
+           FROM (SELECT FORMULA_NO, BATCH_ID, ITEM, LINE_NO, MAX(ACTUAL_QTY) AS ACTUAL_QTY
+                 FROM WIP_Last_3_Years WHERE LINE_TYPE = 'Ingridient'
+                 GROUP BY FORMULA_NO, BATCH_ID, ITEM, LINE_NO) t
+           GROUP BY FORMULA_NO, ITEM""",
+        engine,
+    )
+    supply["ITEM"] = supply["ITEM"].astype(str).str.strip()
+    supply["NEW_DUE_DATE"] = supply["NEW_DUE_DATE"].astype(str)
+    for c in ("FORMULA_NO", "ITEM"):
+        wip[c] = wip[c].astype(str).str.strip()
+    return {"supply": _df_to_records(supply), "wip3y": _df_to_records(wip)}
+
+
+@ttl_cache(300)
+def get_rm_items(items: tuple) -> dict:
+    """Item-level data for the RMs of the analysed trees:
+      po      every non-cancelled PO line (latest picked by PO_NO downstream —
+              PO_CREATION_DATE is often empty)
+      cost    standard cost, current period, all orgs
+      master  primary UOM (org EM)
+      onhand  lot-level on-hand with status and expiry
+      ascp    every ASCP row for these items (on hand, POs, demand, forecast)"""
+    engine = get_dwh_engine()
+    ins = _in_list(items)
+    po = pd.read_sql(
+        f"SELECT [Item Number] AS ITEM, PO_NO, LN, CURR, RATE, LN_UOM, LN_U_PRICE, VENDOR_NAME, LN_CANCEL_F "
+        f"FROM BTG_PO_V WHERE [Item Number] IN ({ins})",
+        engine,
+    )
+    cost = pd.read_sql(
+        f"SELECT ITEM, TRY_CAST(ITEM_COST AS FLOAT) AS ITEM_COST, ORGANIZATION_CODE "
+        f"FROM Items_Cost_CurrentPeriod_V WHERE ITEM IN ({ins})",
+        engine,
+    )
+    master = pd.read_sql(
+        f"SELECT ITEM_NUMBER AS ITEM, PRIMARY_UOM_CODE FROM MasterItemsBI "
+        f"WHERE ORGANIZATION_CODE = 'EM' AND ITEM_NUMBER IN ({ins})",
+        engine,
+    )
+    onhand = pd.read_sql(
+        f"SELECT ORGANIZATION_CODE, ITEM, LOT, TOTAL_QOH, PRIMARY_UOM_CODE, SUBINVENTORY_CODE, STATUS_CODE, "
+        f"EXPIRATION_DATE FROM BTG_OnHand_V WHERE ITEM IN ({ins})",
+        engine,
+    )
+    ascp = pd.read_sql(
+        f"SELECT ITEM, ORGANIZATION, ORDER_TYPE_TEXT, QUANTITY, NEW_DUE_DATE, Order_Number "
+        f"FROM ASCPDemandSupplyBI WHERE ITEM IN ({ins})",
+        engine,
+    )
+    for df in (po, cost, master, onhand, ascp):
+        df["ITEM"] = df["ITEM"].astype(str).str.strip()
+    onhand["EXPIRATION_DATE"] = onhand["EXPIRATION_DATE"].astype(str)
+    ascp["NEW_DUE_DATE"] = ascp["NEW_DUE_DATE"].astype(str)
+    return {k: _df_to_records(v) for k, v in
+            {"po": po, "cost": cost, "master": master, "onhand": onhand, "ascp": ascp}.items()}

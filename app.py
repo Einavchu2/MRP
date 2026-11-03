@@ -433,6 +433,8 @@ if st.session_state.app_mode is None:
         st.session_state.app_mode = "SKU Tracking"
     elif _qp_page in ("tpl", "globus"):
         st.session_state.app_mode = "Globus TPL"
+    elif _qp_page in ("rm", "rm_analysis"):
+        st.session_state.app_mode = "RM Analysis"
     else:
         st.session_state.app_mode = "Simulation"
 
@@ -1007,7 +1009,7 @@ renderTable();
 # HEADER
 # ══════════════════════════════════════════════════════════════
 
-if st.session_state.app_mode in ("SKU Tracking", "Globus TPL"):
+if st.session_state.app_mode in ("SKU Tracking", "Globus TPL", "RM Analysis"):
     if st.button("⬅️ Back to MRP Simulation"):
         with st.spinner("🔄 Loading MRP Simulation…"):
             st.session_state.app_mode = "Simulation"
@@ -1016,9 +1018,12 @@ if st.session_state.app_mode in ("SKU Tracking", "Globus TPL"):
     if st.session_state.app_mode == "SKU Tracking":
         st.title("🔎 SKU Procurement Tracking")
         st.caption("Track open procurement issues per SKU — status, priority, next follow-up date, supplier and running notes.")
-    else:
+    elif st.session_state.app_mode == "Globus TPL":
         st.title("🏬 Globus TPL – Storage Savings")
         st.caption("פוטנציאל חיסכון באחסון במחסן גלובוס — איחוד משטחים לפי אצוות ספק, Safety Stock, מלאי עודף ומלאי מת.")
+    else:
+        st.title("🧪 RM Analysis – Raw Materials by Parent Product")
+        st.caption("חומרי גלם ייחודיים / מרכזיים למק״טי אב, כמויות ומחירים לדרישה, ומצב מלאי מול הייצור הקיים.")
 else:
     st.title("🏭 MRP / BOM Simulation Engine")
     st.caption("Supply Chain · What-If Analysis")
@@ -1190,13 +1195,18 @@ if st.session_state.app_mode == "Globus TPL":
     render_tpl()
     st.stop()
 
+if st.session_state.app_mode == "RM Analysis":
+    from src.rm_analysis_ui import render_rm_analysis
+    render_rm_analysis()
+    st.stop()
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════
 
 with st.sidebar:
     st.header("⚙️ Application Settings")
-    _mode_options = ["Simulation", "SKU Tracking", "Globus TPL"]
+    _mode_options = ["Simulation", "SKU Tracking", "Globus TPL", "RM Analysis"]
     pending_mode = st.selectbox(
         "App Mode",
         _mode_options,

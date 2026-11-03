@@ -60,3 +60,18 @@ def load_substitutes() -> pd.DataFrame:
         return pd.DataFrame(_get("/substitutes"))
     except Exception:
         return pd.DataFrame(columns=["Main_Item", "Substitute_Item"])
+
+
+@st.cache_data(ttl=300, show_spinner="Loading BOM for RM analysis…")
+def load_rm_bom() -> pd.DataFrame:
+    return pd.DataFrame(_get("/rm/bom"))
+
+
+@st.cache_data(ttl=300, show_spinner="Loading production plan & WIP history…")
+def load_rm_plan() -> dict:
+    return {k: pd.DataFrame(v) for k, v in _get("/rm/plan").items()}
+
+
+@st.cache_data(ttl=300, show_spinner="Loading prices, on-hand & ASCP for the raw materials…")
+def load_rm_items(items: tuple) -> dict:
+    return {k: pd.DataFrame(v) for k, v in _get("/rm/items", items=",".join(items)).items()}
