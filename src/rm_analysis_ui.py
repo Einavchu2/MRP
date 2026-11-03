@@ -153,9 +153,22 @@ def render_rm_analysis():
     if not inp:
         st.info("יש להזין לפחות מק״ט אב אחד עם עץ מוצר.")
         return
-    targets, family, batches, fwd, short, main_share = inp
+    # The table only recalculates on Apply; the first visit applies the defaults.
+    pending = (tuple(inp[0]), tuple(inp[1]), tuple(sorted(inp[2].items())), *inp[3:])
+    if "rm_applied" not in st.session_state:
+        st.session_state.rm_applied = pending
+    changed = pending != st.session_state.rm_applied
+    c1, c2 = st.columns([1, 4])
+    if c1.button("✅ Apply", key="rm_apply", type="primary", disabled=not changed, width="stretch"):
+        st.session_state.rm_applied = pending
+        st.rerun()
+    if changed:
+        with c2.container(key="rm_rtl_pending"):
+            st.warning("יש שינויים שלא הוחלו – לחצו **Apply** כדי לרענן את הטבלה. התוצאות למטה עדיין לפי ההגדרות הקודמות.")
+    t_, f_, b_, fwd, short, main_share = st.session_state.rm_applied
+    targets, family, batches = list(t_), list(f_), dict(b_)
     try:
-        R, pinfo = _run(tuple(targets), tuple(family), tuple(sorted(batches.items())), fwd, short, main_share)
+        R, pinfo = _run(t_, f_, b_, fwd, short, main_share)
     except Exception as e:
         st.error(f"הניתוח נכשל: {e}")
         return
