@@ -1,5 +1,12 @@
 [server]
 headless = true
+# Served through IIS at http://<server>/MRP_simulation/ (C:\inetpub\mrp_simulation_proxy).
+# Streamlit only accepts WebSocket origins of localhost / the machine's IP by
+# default, so browsing by host name would hang on "Connecting…" without these.
+corsAllowedOrigins = [
+    "http://FEIL1338VS",
+    "http://feil1338vs.ferringworld.local",
+]
 
 [browser]
 gatherUsageStats = false

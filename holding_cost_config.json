@@ -1,0 +1,32 @@
+{
+  "_note": "Settings for the Inventory Holding Cost analysis (src/holding_cost.py). Edit values here; the app reads this file on every load.",
+
+  "carrying_cost_rate_annual": null,
+  "_carrying_cost_rate_note": "Annual inventory carrying cost rate as a fraction (e.g. 0.20 = 20%/year). NOT SET: no rate exists in the DWH or app. Obtain from Finance (Controlling / Treasury: cost of capital + storage + insurance + obsolescence allowance). Until set, ranking/Pareto/score are computed on average inventory value (identical ordering) and holding-cost amounts show as blank.",
+
+  "currency": "ILS",
+  "analysis_days": 365,
+
+  "abc_thresholds": {
+    "A": 0.80,
+    "B": 0.95
+  },
+
+  "flags": {
+    "high_value_percentile": 0.80,
+    "high_days_on_hand": 180,
+    "slow_moving_turns": 1.0,
+    "no_recent_consumption_days": 90,
+    "high_cost_classes": ["A"]
+  },
+  "_flags_note": "Proposed defaults, not approved business rules. high_value_percentile: current inventory value at or above this percentile of valued items = HIGH VALUE. slow_moving_turns: annual consumption value / average inventory value below this = SLOW MOVING.",
+
+  "score_weights": {
+    "holding_cost": 35,
+    "days_on_hand": 20,
+    "excess_inventory": 20,
+    "consumption_velocity": 15,
+    "inventory_value": 10
+  },
+  "score_weights_status": "PROPOSED - awaiting business approval"
+}

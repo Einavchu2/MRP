@@ -32,8 +32,11 @@ def _read_csv_with_fallback(path: str, **kwargs) -> pd.DataFrame:
     return pd.read_csv(path, encoding="latin-1", **kwargs)
 
 
-def load_master() -> pd.DataFrame:
-    """Load mrp_current.csv and return a clean master DataFrame indexed by item."""
+def load_master(fill_defaults: bool = True) -> pd.DataFrame:
+    """Load mrp_current.csv and return a clean master DataFrame indexed by item.
+
+    fill_defaults=False leaves blank SS/LT/MAX INVENTORY as NaN — the Holding
+    Cost analysis must not treat a missing target as the 15-month default."""
     df = _read_csv_with_fallback(_MASTER_FILE, dtype={"item": str})
     df = df.rename(columns=_COL_MAP)
     df["item"] = df["item"].astype(str).str.strip()
@@ -42,6 +45,9 @@ def load_master() -> pd.DataFrame:
     for col in ["lead_time", "safety_stock", "max_inventory", "shelf_life", "list_price"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if not fill_defaults:
+        return df.set_index("item")
 
     # Defaults for missing values
     df["safety_stock"]  = df["safety_stock"].fillna(7.0)    # default 7 months

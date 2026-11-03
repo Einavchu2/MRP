@@ -350,6 +350,8 @@ _DEFAULT_SS     = 7
 _DEFAULT_TARGET = 15
 _DEFAULT_LT     = 3
 _DEFAULT_SL     = 24
+_MAX_COVER      = 999.0  # cap — a near-zero (not exactly zero) forward window average
+                          # can otherwise blow COVER_MONTHS up into the millions
 
 
 def _window_mean(arr: np.ndarray) -> float:
@@ -366,6 +368,116 @@ def _sum_by_item(pivot: pd.DataFrame, mask: pd.Series, month_cols: list) -> dict
     sub[month_cols] = sub[month_cols].apply(pd.to_numeric, errors="coerce")
     grouped = sub.groupby("item")[month_cols].sum(min_count=1)
     return {item: row.to_numpy(dtype=float) for item, row in grouped.iterrows()}
+
+
+def _runout_cover(remaining: float, forecast_arr: np.ndarray, i: int, n_months: int, month_cols: list):
+    """
+    Forward runout: how many months of forward demand `remaining` (the ending
+    inventory at month i) actually covers, walking month-by-month and
+    accumulating real forecast demand until it's exhausted — rather than
+    dividing by a fixed-window average, which can rise even as inventory
+    falls whenever the window's composition happens to shift toward sparser
+    months (this is what a fixed 7-month average did for genuinely lumpy,
+    intermittent-demand items; the runout walk tracks INV directly instead).
+
+    A zero-demand month still counts as one covered calendar month (nothing
+    is consumed) without resolving anything; the first month whose demand
+    would consume the rest of `remaining` resolves the fractional answer.
+    This also correctly handles an already-negative (over-depleted) INV with
+    no special-casing: a negative `remaining` immediately satisfies
+    `remaining <= demand` at the first month with positive demand, producing
+    a proportionally negative cover — the natural analog of the old ratio's
+    negative-coverage case.
+
+    Returns (cover, reason, steps) — steps is the walked (month, demand,
+    remaining_after) list, for the hover-tooltip breakdown.
+    """
+    steps = []
+    for k in range(1, n_months - i):
+        idx = i + k
+        demand = forecast_arr[idx]
+        if demand <= 0:
+            steps.append((month_cols[idx], demand, remaining))
+            continue
+        if remaining <= demand:
+            steps.append((month_cols[idx], demand, remaining - demand))
+            # min(..., _MAX_COVER) guards only against a pathologically tiny
+            # (but nonzero) final demand blowing the fraction up absurdly —
+            # not the normal case.
+            return min((k - 1) + remaining / demand, _MAX_COVER), "computed", steps
+        remaining -= demand
+        steps.append((month_cols[idx], demand, remaining))
+    if not np.any(forecast_arr[i + 1:] > 0):
+        return np.nan, "no_forward_demand", steps
+    # Walked every future month the data actually has, and demand still never
+    # exhausted this inventory. The true coverage is longer than the visible
+    # forecast horizon — report that honestly (how many months we actually
+    # confirmed, a real and month-to-month-varying number) rather than an
+    # arbitrary constant, which would otherwise repeat identically for every
+    # month near the end of the horizon and look like a broken/stuck value.
+    return float(n_months - i - 1), "beyond_horizon", steps
+
+
+def compute_item_inv_cover(forecast_raw, po_raw, onhand_raw, month_cols: list):
+    """
+    Per-item INV / COVER_MONTHS series — the single source of truth shared by
+    _compute_inv_cover() (bulk pivot calculation) and the UI's hover-tooltip
+    explainer, so the two can never drift out of sync with each other again.
+
+    Timing convention (fixed — do not mix with a different one elsewhere):
+    INV[m] is ENDING inventory for month m, i.e. AFTER consuming month m's
+    demand. COVER_MONTHS[m] is a forward RUNOUT of that ending inventory —
+    see _runout_cover() — computed from demand starting at m+1 (never m
+    itself), since month m's demand is already subtracted out of INV and
+    must not be counted again. Coverage is recomputed every month from
+    current INV and the forward demand horizon; it does not freeze. A blank
+    forecast month is treated as 0 demand (not carried forward from the last
+    known month). If there is no positive demand anywhere in the forward
+    horizon, COVER_MONTHS is N/A (not a fabricated or capped number) —
+    there's nothing to run out against.
+
+    Returns (inv_arr, cover_arr, first_oh_idx, detail) where `detail` is a
+    list of per-month dicts (aligned to month_cols, None before first_oh_idx)
+    describing how each COVER_MONTHS cell was derived.
+    """
+    n_months = len(month_cols)
+    if forecast_raw is None:
+        forecast_raw = np.full(n_months, np.nan)
+    forecast_arr = pd.Series(forecast_raw).clip(lower=0).fillna(0).to_numpy(dtype=float)
+    po_arr       = np.nan_to_num(po_raw,     nan=0.0) if po_raw     is not None else np.zeros(n_months)
+    onhand_arr   = np.nan_to_num(onhand_raw, nan=0.0) if onhand_raw is not None else np.zeros(n_months)
+
+    inv_arr   = np.full(n_months, np.nan)
+    cover_arr = np.full(n_months, np.nan)
+    detail: list = [None] * n_months
+
+    first_oh_idx = next((i for i in range(n_months) if onhand_arr[i] > 0), None)
+    if first_oh_idx is None:
+        return inv_arr, cover_arr, None, detail
+
+    first_oh = month_cols[first_oh_idx]
+    started = False
+    running_inventory = 0.0
+
+    for i, m in enumerate(month_cols):
+        if not started:
+            if m == first_oh:
+                started = True
+            else:
+                continue
+        running_inventory = running_inventory + po_arr[i] - forecast_arr[i]
+        if m == first_oh:
+            running_inventory = onhand_arr[i] + po_arr[i] - forecast_arr[i]
+        inv_arr[i] = running_inventory
+
+        cover, reason, steps = _runout_cover(running_inventory, forecast_arr, i, n_months, month_cols)
+        cover_arr[i] = cover
+        detail[i] = {
+            "inv": running_inventory,
+            "steps": steps, "cover": cover, "reason": reason,
+        }
+
+    return inv_arr, cover_arr, first_oh_idx, detail
 
 
 def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataFrame:
@@ -414,36 +526,26 @@ def _compute_inv_cover(pivot: pd.DataFrame, master_map: dict = None) -> pd.DataF
         cover_row  = {"item":material,"ORDER_TYPE_FINAL":"COVER_MONTHS"}
         po_rec_row = {"item":material,"ORDER_TYPE_FINAL":"PO_RECOMMENDATION"}
 
-        if forecast_raw is None:
-            forecast_raw = np.full(n_months, np.nan)
-        # clip(lower=0).ffill().fillna(0) — tiny (n_months long), pandas is fine here
-        forecast_arr = pd.Series(forecast_raw).clip(lower=0).ffill().fillna(0).to_numpy(dtype=float)
-        po_arr       = np.nan_to_num(po_raw,     nan=0.0) if po_raw     is not None else np.zeros(n_months)
-        onhand_arr   = np.nan_to_num(onhand_raw, nan=0.0) if onhand_raw is not None else np.zeros(n_months)
-
-        first_oh_idx = next((i for i in range(n_months) if onhand_arr[i] > 0), None)
+        inv_arr, cover_arr, first_oh_idx, _detail = compute_item_inv_cover(
+            forecast_raw, po_raw, onhand_raw, month_cols
+        )
         if first_oh_idx is None: continue
         first_oh = month_cols[first_oh_idx]
 
-        started = False
-        running_inventory = 0.0
-        inv_arr   = np.full(n_months, np.nan)
-        cover_arr = np.full(n_months, np.nan)
+        # Local arrays for the PO-simulation pass below (kept identical to what
+        # compute_item_inv_cover used internally).
+        if forecast_raw is None:
+            forecast_raw = np.full(n_months, np.nan)
+        forecast_arr = pd.Series(forecast_raw).clip(lower=0).fillna(0).to_numpy(dtype=float)
+        po_arr       = np.nan_to_num(po_raw,     nan=0.0) if po_raw     is not None else np.zeros(n_months)
+        onhand_arr   = np.nan_to_num(onhand_raw, nan=0.0) if onhand_raw is not None else np.zeros(n_months)
 
         for i, m in enumerate(month_cols):
-            if not started:
-                if m==first_oh: started=True
-                else:
-                    inv_row[m]=cover_row[m]=po_rec_row[m]=np.nan
-                    continue
-            running_inventory = running_inventory + po_arr[i] - forecast_arr[i]
-            if m==first_oh: running_inventory = onhand_arr[i] + po_arr[i] - forecast_arr[i]
-            inv_row[m] = running_inventory
-            inv_arr[i] = running_inventory
-            future_avg = _window_mean(forecast_arr[i:i+7])
-            cover = running_inventory/future_avg if future_avg>0 else np.nan
-            cover_row[m] = cover
-            cover_arr[i] = cover
+            if i < first_oh_idx:
+                inv_row[m] = cover_row[m] = po_rec_row[m] = np.nan
+            else:
+                inv_row[m]   = inv_arr[i]   if not np.isnan(inv_arr[i])   else np.nan
+                cover_row[m] = cover_arr[i] if not np.isnan(cover_arr[i]) else np.nan
 
         running_inv_sim = inv_arr.copy()
         running_cov_sim = cover_arr.copy()

@@ -1,0 +1,49 @@
+{
+  "_comment": "Non-secret settings for the MRP daily monitor. Credentials (SMTP, webhook URLs) live in monitoring\\.env instead — see .env.example.",
+
+  "app_root": "C:\\Users\\EINA-ADM\\Desktop\\mrp_simulation",
+
+  "endpoints": {
+    "streamlit_health": "http://127.0.0.1:8501/_stcore/health",
+    "api_health": "http://127.0.0.1:8502/health",
+    "api_proxy_health": "http://127.0.0.1:8503/health"
+  },
+
+  "services": [
+    { "name": "service_streamlit", "task": "Streamlit App", "port": 8501, "match": "streamlit" },
+    { "name": "service_api",       "task": "Data API",      "port": 8502, "match": "uvicorn" }
+  ],
+
+  "iis": {
+    "sites": ["MrpApiProxy"]
+  },
+
+  "sqlite_db": "outputs\\sku_tracking.db",
+
+  "log_files": {
+    "streamlit_err": "streamlit.err.log",
+    "api": "api.log"
+  },
+
+  "thresholds": {
+    "disk_free_pct_warn": 15,
+    "disk_free_pct_critical": 8,
+    "cpu_pct_warn": 85,
+    "cpu_pct_critical": 95,
+    "mem_pct_warn": 85,
+    "mem_pct_critical": 95,
+    "http_timeout_sec": 8
+  },
+
+  "retry": {
+    "max_attempts": 3,
+    "backoff_sec": [15, 45, 90]
+  },
+
+  "circuit_breaker": {
+    "max_remediations_per_check_per_day": 3,
+    "cooldown_minutes_between_attempts": 10
+  },
+
+  "_paths_note": "reports/, state/, and alerts/ always live next to this file (monitoring\\reports, monitoring\\state, monitoring\\alerts) — not configurable here, since Invoke-DailyHealthCheck.ps1 resolves them from its own script location, not from this file."
+}

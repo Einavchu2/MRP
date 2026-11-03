@@ -1,14 +1,20 @@
 """
-sku_tracking.py — SKU-level procurement follow-up tracker.
-Persists one row per open/closed procurement issue for a SKU
-(status, priority, request/follow-up dates, supplier, running notes).
+sku_tracking.py — thin HTTP client for SKU Procurement Tracking.
+
+The API (api/sku_db.py) owns the actual storage now — a real SQLite
+database instead of outputs/sku_tracking.csv (kept as a migration backup,
+not read at runtime anymore). Same pattern as src/db.py: this module just
+calls the API and converts JSON to/from DataFrames/dicts.
 """
 import os
-import uuid
+
 import pandas as pd
+import requests
 
 _FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs", "sku_tracking.csv")
-SKU_TRACKING_FILE = _FILE
+SKU_TRACKING_FILE = _FILE  # legacy CSV — retained on disk as a backup, not read/written anymore
+
+API_BASE_URL = os.environ.get("MRP_API_URL", "http://127.0.0.1:8502")
 
 COLUMNS = [
     "id",
@@ -23,77 +29,70 @@ COLUMNS = [
     "priority",
     "status",
     "update_notes",
+    "comments_procurement",
     "owner",
     "last_updated",
 ]
 
 STATUS_OPTIONS   = ["🟢 הושלם", "🟡 בטיפול", "🔴 טרם טופל"]
-PRIORITY_OPTIONS = ["🔴 דחוף", "🟡 בינוני", "⚪ רגיל"]
+PRIORITY_OPTIONS = ["🔴 דחוף מאוד", "🔴 דחוף", "🟡 בינוני", "⚪ רגיל"]
 REQUEST_TYPES    = [
     "הקדמת הזמנה", "הגדלת הזמנה", "הקדמת אספקה", "אישור אספקה",
-    "בירור סטטוס", "עדכון PO", "חסר PD", "אחר",
+    "בירור סטטוס", "עדכון PO", "חסר PD", "אין PD",
+    "ביטול הזמנה", "קליטת מלאי", "החזרה ואספקת מלאי תקין", "הזמנה מתעכבת",
+    "תיקון PD", "החזרת מלאי", "שינוי גודל הזמנה", "לא הוקמה הזמנה", "אחר",
 ]
 
 
-def _ensure_file() -> None:
-    os.makedirs(os.path.dirname(_FILE), exist_ok=True)
-    if not os.path.exists(_FILE):
-        pd.DataFrame(columns=COLUMNS).to_csv(_FILE, index=False)
+def _request(method: str, path: str, **kwargs):
+    try:
+        resp = requests.request(method, f"{API_BASE_URL}{path}", timeout=30, **kwargs)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            f"Could not reach the data API at {API_BASE_URL} — is it running? "
+            f"(start it with run_api.bat / run_api.sh)"
+        ) from e
+    return resp.json() if resp.content else None
 
 
 def load_tracking() -> pd.DataFrame:
-    """Load the SKU tracking CSV, normalized to COLUMNS."""
-    _ensure_file()
-    df = pd.read_csv(_FILE, dtype=str).fillna("")
+    """Load every SKU tracking row, normalized to COLUMNS."""
+    rows = _request("GET", "/sku-tracking")
+    df = pd.DataFrame(rows)
     for col in COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    return df[COLUMNS]
+    return df[COLUMNS].fillna("") if not df.empty else pd.DataFrame(columns=COLUMNS)
 
 
-def save_tracking(df: pd.DataFrame) -> None:
-    """Persist the full tracking table back to CSV."""
-    _ensure_file()
-    df = df.copy()
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[COLUMNS]
-    df.to_csv(_FILE, index=False)
+def create_tracking_row(row: dict) -> dict:
+    """Create one new tracking row. `row` need not include "id" or
+    "last_updated" — both are assigned server-side."""
+    return _request("POST", "/sku-tracking", json=row)
 
 
-def add_entry(
-    item: str,
-    description: str = "",
-    supplier: str = "",
-    procurement_rep: str = "",
-    planner_code: str = "",
-    request_type: str = "",
-    request_date: str = "",
-    next_action_date: str = "",
-    priority: str = "⚪ רגיל",
-    status: str = "🔴 טרם טופל",
-    update_notes: str = "",
-    owner: str = "",
-) -> pd.DataFrame:
-    """Append a new SKU tracking row and return the updated table."""
-    df = load_tracking()
-    row = {
-        "id":               uuid.uuid4().hex[:10],
-        "item":              str(item).strip(),
-        "description":       str(description).strip(),
-        "supplier":          str(supplier).strip(),
-        "procurement_rep":   str(procurement_rep).strip(),
-        "planner_code":      str(planner_code).strip(),
-        "request_type":      str(request_type).strip(),
-        "request_date":      str(request_date).strip(),
-        "next_action_date":  str(next_action_date).strip(),
-        "priority":          str(priority).strip(),
-        "status":            str(status).strip(),
-        "update_notes":      str(update_notes).strip(),
-        "owner":             str(owner).strip(),
-        "last_updated":      pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_tracking(df)
-    return load_tracking()
+def update_tracking_row(row_id: str, fields: dict) -> None:
+    """Update only the given fields of one existing row by id."""
+    _request("PATCH", f"/sku-tracking/{row_id}", json=fields)
+
+
+def delete_tracking_row(row_id: str) -> None:
+    _request("DELETE", f"/sku-tracking/{row_id}")
+
+
+def load_user_filters(uid: str) -> dict:
+    """Last-saved SKU Tracking filter selection for this browser. Fails soft
+    (empty dict) if the API is unreachable — a convenience feature must never
+    break the page."""
+    try:
+        return _request("GET", f"/user-filters/{uid}") or {}
+    except RuntimeError:
+        return {}
+
+
+def save_user_filters(uid: str, filters: dict) -> None:
+    try:
+        _request("PUT", f"/user-filters/{uid}", json=filters)
+    except RuntimeError:
+        pass

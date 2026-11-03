@@ -1,7 +1,6 @@
 """
 data_prep.py  –  BOM enrichment + MRP pivot builder
 Logic follows model_sim.ipynb exactly.
-Outputs: full_bom (bom_with_conversion.xlsx) + pivot_df (mrp_output.xlsx)
 """
 
 import pandas as pd
@@ -15,7 +14,6 @@ import numpy as np
 def enrich_bom(bom_raw: pd.DataFrame, df_uom: pd.DataFrame) -> pd.DataFrame:
     """
     Merge BOM with UOM conversion rates → adds BOM_CONV column.
-    Saves bom_with_conversion.xlsx in the outputs folder.
     """
     df_bom = bom_raw.copy()
     df_uom = df_uom.copy()
@@ -64,7 +62,6 @@ def enrich_bom(bom_raw: pd.DataFrame, df_uom: pd.DataFrame) -> pd.DataFrame:
     if "PRUDUCT_QTY" in df_merged.columns:
         df_merged["PRUDUCT_QTY"] = pd.to_numeric(df_merged["PRUDUCT_QTY"], errors="coerce")
 
-    df_merged.to_excel("outputs/bom_with_conversion.xlsx", index=False, engine="openpyxl")
     return df_merged
 
 
@@ -75,7 +72,6 @@ def enrich_bom(bom_raw: pd.DataFrame, df_uom: pd.DataFrame) -> pd.DataFrame:
 def build_mrp_pivot(df_trx: pd.DataFrame, df_ascp: pd.DataFrame) -> pd.DataFrame:
     """
     Build the MRP pivot from transactions + ASCP.
-    Saves mrp_output.xlsx in the outputs folder.
     """
     # ── Actual transactions ──────────────────
     df = df_trx.copy()
@@ -184,5 +180,4 @@ def build_mrp_pivot(df_trx: pd.DataFrame, df_ascp: pd.DataFrame) -> pd.DataFrame
     ]
     pivot_df = pivot_df[cols]
 
-    pivot_df.to_excel("outputs/mrp_output.xlsx", index=False)
     return pivot_df

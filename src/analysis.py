@@ -215,8 +215,14 @@ def compute_demand_spikes(pivot, z_thresh=2.0, pct_thresh=0.6):
         if len(hist_vals) >= 3:
             baseline_mean, baseline_std = float(hist_vals.mean()), float(hist_vals.std())
         else:
+            # No forecast history to compare against — fall back to the future window
+            # itself, but keep blank/zero months IN the baseline (as 0). Filtering them
+            # out (as the history-based baseline does) would average the spikes against
+            # each other and wash out exactly the "isolated peak among quiet months"
+            # pattern this is meant to catch.
             fut_vals = pd.to_numeric(grp[future_months].values.flatten(), errors="coerce") if future_months else np.array([])
-            fut_vals = fut_vals[~np.isnan(fut_vals) & (fut_vals > 0)]
+            fut_vals = np.nan_to_num(fut_vals, nan=0.0)
+            fut_vals = np.clip(fut_vals, a_min=0, a_max=None)
             if len(fut_vals) >= 3:
                 baseline_mean, baseline_std = float(fut_vals.mean()), float(fut_vals.std())
             else:
@@ -275,3 +281,255 @@ def compute_forecast_accuracy(pivot):
     if not rows:
         return pd.DataFrame(columns=["item","description","month","forecast","actual","error","abs_error","mape"])
     return pd.DataFrame(rows).sort_values(["item", "month"])
+
+
+def compute_forecast_vs_recent_trend(pivot, forecast_months=18, actual_months=24,
+                                      mismatch_ratio=1.5, today=None):
+    """
+    Flags items where the forward forecast's average monthly rate diverges
+    significantly from the recent actual consumption rate.
+
+    This catches what compute_forecast_accuracy() structurally cannot: that
+    function only compares forecast and actual within the SAME calendar month,
+    but a rolling forecast is entered for future months and actuals only exist
+    for past ones — they almost never land in the same month, so accuracy
+    comes back empty for most items regardless of whether the forecast is any
+    good. This check instead compares two separate windows: real consumption
+    over the trailing `actual_months`, against the forecast over the next
+    `forecast_months` — the actual question "does the plan still match how
+    this item is really being used lately?"
+
+    Deliberately NOT restricted to RM1/RM2 planner codes the way every other
+    ML Analysis tab is — an item with planner_code "KPI - Ignore" (or any
+    other code) is exactly the kind of item that's invisible everywhere else,
+    which is the reason this check exists.
+
+    today: anchor splitting the actual window (the `actual_months` months
+    ending the month before `today`) from the forecast window (`forecast_months`
+    months starting this month) — defaults to the real current date. Not
+    derived from On Hand data, so it works for items with no On Hand row at
+    all (unlike compute_risk).
+
+    A month with no transaction/forecast row is treated as a genuine zero,
+    not missing data — both rates are true monthly averages over the full
+    window, not just the populated months.
+
+    Returns one row per flagged item: item, description, planner_code,
+    actual_rate, forecast_rate, ratio, direction, and the window boundaries
+    used (so the UI can show exactly what was compared).
+    """
+    if today is None:
+        today = pd.Timestamp.now()
+    today = pd.Timestamp(today).replace(day=1)
+
+    actual_start = today - pd.DateOffset(months=actual_months)
+    actual_window = [(actual_start + pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(actual_months)]
+    forecast_window = [(today + pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(forecast_months)]
+
+    fcst_rows = pivot[pivot["ORDER_TYPE_FINAL"].str.contains("forecast", case=False, na=False)]
+    act_rows  = pivot[pivot["ORDER_TYPE_FINAL"].str.contains("actual",   case=False, na=False)]
+    # dropna first — an item can have a real description on one row and NaN on
+    # another (e.g. its On Hand row), and without this, drop_duplicates("item")
+    # can keep the NaN row and leave every consumer with a float, not a string.
+    mm_local  = (pivot[["item", "description"]].dropna(subset=["description"])
+                 .drop_duplicates("item").set_index("item")["description"].to_dict())
+
+    all_items = pivot["item"].dropna().unique()
+    rows = []
+    for item in all_items:
+        ai = act_rows[act_rows["item"] == item]
+        fi = fcst_rows[fcst_rows["item"] == item]
+
+        act_cols = [m for m in actual_window if m in ai.columns]
+        fcst_cols = [m for m in forecast_window if m in fi.columns]
+
+        # np.nansum, not .sum() — pd.to_numeric() on a raw ndarray (not a
+        # Series) returns a plain ndarray, and ndarray.sum() propagates NaN
+        # instead of skipping it the way Series.sum() does. That silently
+        # zeroed out every item with any gap month in its window (i.e. most
+        # of them) until caught by hand-tracing a real item against this code.
+        act_sum = np.nansum(pd.to_numeric(ai[act_cols].values.flatten(), errors="coerce")) if not ai.empty and act_cols else 0.0
+        fcst_sum = np.nansum(pd.to_numeric(fi[fcst_cols].values.flatten(), errors="coerce")) if not fi.empty and fcst_cols else 0.0
+        act_sum = 0.0 if np.isnan(act_sum) else float(act_sum)
+        fcst_sum = 0.0 if np.isnan(fcst_sum) else float(fcst_sum)
+
+        actual_rate = act_sum / actual_months
+        forecast_rate = fcst_sum / forecast_months
+
+        if actual_rate <= 0 and forecast_rate <= 0:
+            continue
+
+        if actual_rate <= 0:
+            direction, ratio = "no recent demand", None
+            flagged = forecast_rate > 0
+        else:
+            ratio = forecast_rate / actual_rate
+            if ratio >= mismatch_ratio:
+                direction, flagged = "over-forecast", True
+            elif ratio <= 1 / mismatch_ratio:
+                direction, flagged = "under-forecast", True
+            else:
+                direction, flagged = "in line", False
+
+        if not flagged:
+            continue
+
+        rows.append({
+            "item": item,
+            "description": mm_local.get(item, ""),
+            "actual_rate": round(actual_rate, 2),
+            "forecast_rate": round(forecast_rate, 2),
+            "ratio": round(ratio, 2) if ratio is not None else None,
+            "direction": direction,
+            "actual_window": f"{actual_window[0]} → {actual_window[-1]}",
+            "forecast_window": f"{forecast_window[0]} → {forecast_window[-1]}",
+        })
+
+    cols = ["item","description","actual_rate","forecast_rate","ratio","direction",
+            "actual_window","forecast_window"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    def _extremity(r):
+        # How far the ratio sits from 1 (in either direction) — used only to
+        # rank rows worst-first. None ("no recent demand") sorts as most extreme.
+        if r is None or pd.isna(r):
+            return np.inf
+        if r <= 0:
+            return np.inf
+        return max(r, 1 / r)
+
+    out = pd.DataFrame(rows, columns=cols)
+    out["_extremity"] = out["ratio"].apply(_extremity)
+    return out.sort_values("_extremity", ascending=False).drop(columns="_extremity")
+
+
+# ─── Spike anomaly classification ───────────────────────────────────────────
+
+ANOMALY_CATEGORIES = {
+    "demand_consumption_mismatch": ("Demand-Consumption Mismatch",     "חוסר התאמה בין תחזית/ביקוש לבין צריכה בפועל"),
+    "forecast_bias":               ("Forecast Bias",                  "הטיה שיטתית בתחזית"),
+    "structural_break":            ("Structural Break / Regime Change","שינוי מבני / שינוי דפוס ביקוש"),
+    "over_forecasting_risk":       ("Over-Forecasting Risk",          "סיכון לתחזית יתר"),
+    "demand_signal_distortion":    ("Demand Signal Distortion",       "עיוות באות הביקוש"),
+    "inventory_exposure_risk":     ("Inventory Exposure Risk",        "חשיפה לסיכון מלאי"),
+}
+
+
+def classify_spike_anomalies(pivot, spike_df, trends_df=None, accuracy_df=None, risk_df=None):
+    """
+    For each item flagged in spike_df, decide which of the six anomaly categories
+    genuinely apply — by cross-referencing the spike against the item's actual
+    consumption history, historical forecast accuracy (bias/MAPE), demand trend
+    direction, and existing inventory risk. Returns one row per (item, category)
+    match found, with a short rationale; items/categories with no supporting
+    evidence are simply absent (not every category applies to every item).
+    """
+    cols = ["item","description","category_key","category_en","category_he","rationale"]
+    if spike_df is None or spike_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    month_cols = sorted([c for c in pivot.columns if str(c).startswith("202")])
+    fcst_rows = pivot[pivot["ORDER_TYPE_FINAL"].str.contains("forecast", case=False, na=False)]
+    act_rows  = pivot[pivot["ORDER_TYPE_FINAL"].str.contains("actual",   case=False, na=False)]
+    oh_rows   = pivot[pivot["ORDER_TYPE_FINAL"].str.contains("on hand",  case=False, na=False)]
+
+    first_oh = None
+    for m in month_cols:
+        if m in oh_rows.columns and pd.to_numeric(oh_rows[m], errors="coerce").sum() > 0:
+            first_oh = m
+            break
+    hist_idx = month_cols.index(first_oh) if first_oh in month_cols else 0
+    history_months = month_cols[:hist_idx]
+
+    trend_map = dict(zip(trends_df["item"], trends_df["trend_label"])) if trends_df is not None and not trends_df.empty else {}
+    risk_map  = {r["item"]: r for _, r in risk_df.iterrows()} if risk_df is not None and not risk_df.empty else {}
+
+    acc_by_item = {}
+    if accuracy_df is not None and not accuracy_df.empty:
+        for item, g in accuracy_df.groupby("item"):
+            acc_by_item[item] = {"bias": g["error"].mean(), "mape": g["mape"].dropna().mean(), "n": len(g)}
+
+    rows = []
+    for item, spikes in spike_df.groupby("item"):
+        desc = spikes["description"].iloc[0]
+        top  = spikes.sort_values("pct_above_baseline", ascending=False).iloc[0]
+        spike_val = float(top["forecast"])
+        baseline  = float(top["baseline"])
+        month     = top["month"]
+
+        act_vals = pd.to_numeric(act_rows[act_rows["item"] == item][month_cols].values.flatten(), errors="coerce") \
+            if not act_rows.empty else np.array([])
+        act_vals = act_vals[~np.isnan(act_vals) & (act_vals > 0)]
+        avg_actual = float(act_vals.mean()) if len(act_vals) else None
+        max_actual = float(act_vals.max())  if len(act_vals) else None
+
+        fcst_hist_vals = pd.to_numeric(
+            fcst_rows[fcst_rows["item"] == item][history_months].values.flatten(), errors="coerce"
+        ) if history_months else np.array([])
+        fcst_hist_vals = fcst_hist_vals[~np.isnan(fcst_hist_vals) & (fcst_hist_vals > 0)]
+
+        trend = trend_map.get(item, "")
+        acc   = acc_by_item.get(item, {})
+        risk  = risk_map.get(item)  # Series or None
+
+        matches = []
+
+        # 1. Demand-Consumption Mismatch — the spike doesn't line up with real usage
+        if avg_actual is None:
+            matches.append(("demand_consumption_mismatch",
+                f"No actual consumption history exists to validate this demand — the {spike_val:,.0f}-unit spike "
+                f"in {month} can't be confirmed against real usage."))
+        elif spike_val > avg_actual * 1.5 or spike_val < avg_actual * 0.5:
+            direction = "far above" if spike_val > avg_actual else "far below"
+            matches.append(("demand_consumption_mismatch",
+                f"Forecast spike of {spike_val:,.0f} in {month} is {direction} the item's average actual "
+                f"consumption of {avg_actual:,.1f}."))
+
+        # 2. Forecast Bias — forecast systematically runs higher than actual
+        if acc.get("n", 0) >= 3 and acc.get("bias") is not None and avg_actual:
+            bias = acc["bias"]
+            if bias < 0 and abs(bias) / max(avg_actual, 1) >= 0.2:
+                matches.append(("forecast_bias",
+                    f"Forecast has systematically over-stated demand: avg bias {bias:+.1f} units/month over "
+                    f"{acc['n']} overlapping months ({abs(bias)/max(avg_actual,1)*100:.0f}% of typical consumption), "
+                    f"MAPE {acc.get('mape', 0):.0f}%."))
+
+        # 3. Structural Break / Regime Change — plan hasn't adapted to changed behavior
+        if "Declining" in trend:
+            matches.append(("structural_break",
+                f"Actual consumption trend is declining, yet the plan still forecasts a {spike_val:,.0f}-unit "
+                f"spike in {month} — planning hasn't adapted to the changed demand pattern."))
+
+        # 4. Over-Forecasting Risk — spike exceeds anything ever actually consumed
+        if max_actual is not None and spike_val > max_actual * 1.3:
+            matches.append(("over_forecasting_risk",
+                f"The {spike_val:,.0f}-unit spike in {month} exceeds the item's highest-ever actual monthly "
+                f"consumption ({max_actual:,.1f}) by {(spike_val/max_actual-1)*100:.0f}%."))
+
+        # 5. Demand Signal Distortion — planning data isn't grounded in real consumption
+        if len(fcst_hist_vals) < 3:
+            matches.append(("demand_signal_distortion",
+                "No reliable forecast history exists for this item before the current period — the spike is "
+                "being judged against itself rather than a validated demand signal."))
+        elif acc.get("mape") and acc["mape"] > 75:
+            matches.append(("demand_signal_distortion",
+                f"Forecast accuracy has historically been very poor (MAPE {acc['mape']:.0f}%), meaning planning "
+                f"data has not reliably tracked real consumption."))
+
+        # 6. Inventory Exposure Risk — this spike has real stock/PO consequences
+        if risk is not None and ("Critical" in str(risk.get("risk_level", "")) or "High" in str(risk.get("risk_level", ""))):
+            matches.append(("inventory_exposure_risk",
+                f"Item is independently flagged {risk['risk_level']} in the Risk Dashboard "
+                f"(min cover {risk.get('min_cover','?')} mo) — this spike compounds an existing inventory risk."))
+        elif baseline > 0 and spike_val > baseline * 2:
+            matches.append(("inventory_exposure_risk",
+                f"A spike this size ({spike_val:,.0f} vs baseline {baseline:,.1f}) would likely trigger an "
+                f"oversized one-time purchase order and leave excess stock once demand reverts."))
+
+        for key, rationale in matches:
+            en, he = ANOMALY_CATEGORIES[key]
+            rows.append({"item": item, "description": desc, "category_key": key,
+                         "category_en": en, "category_he": he, "rationale": rationale})
+
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
