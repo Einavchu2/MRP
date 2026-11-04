@@ -36,7 +36,9 @@ def _run(targets: tuple, family: tuple, batches: tuple, fwd: int, short: int, ma
 def _inputs(bom: pd.DataFrame):
     pinfo = ra.product_info(bom)
     label = lambda p: f"{p} — {pinfo.FORMULA_DESC1.get(p, '')}"
-    raw = st.text_input("מק״טי אב לניתוח (מופרדים בפסיק)", _DEFAULT, key="rm_targets")
+    raw = st.text_input("מק״טי אב לניתוח (מופרדים בפסיק)", _DEFAULT, key="rm_targets",
+                        help="מק״טים שיש להם עץ מוצר (פורמולה) ב-Oracle. כל חומרי הגלם בעצים שלהם ינותחו. "
+                             "כשמזינים כמה שלבים של אותה שרשרת (Fermentation → Recovery → Bulk), כל שלב נספר רק פעם אחת.")
     targets = list(dict.fromkeys(t for t in re.split(r"[\s,;]+", raw) if t))
     bad = [t for t in targets if t not in pinfo.index]
     if bad:
@@ -65,70 +67,103 @@ def _inputs(bom: pd.DataFrame):
 
 
 def _kpis(R: pd.DataFrame):
-    k = st.columns(6)
-    k[0].metric("חומרי גלם בעץ", f"{len(R)}")
+    need = R[R.req > 0]
+    k = st.columns(5)
+    k[0].metric("חומרי גלם בדרישה", f"{len(need)}", f"מתוך {len(R)} בעץ", delta_color="off",
+                help="חומרי גלם שנדרשים לדרישה הנוכחית. השאר הם קודים חלופיים בעץ (כמות 0 בפורמולה הפעילה).")
     for i, c in enumerate(ra.CLASSES, 1):
-        m = R.cls == c
-        k[i].metric(c, f"{m.sum()}", f"₪{R.loc[m, 'cost'].sum():,.0f}", delta_color="off")
-    k[4].metric("עלות הדרישה", f"₪{R.cost.sum():,.0f}")
-    k[5].metric("חסרים", f"{(R.status == 'חסר').sum()}",
-                f"{(R.status == 'מספיק לדרישה אחת בלבד').sum()} מספיקים לדרישה אחת בלבד", delta_color="off")
+        m = need.cls == c
+        k[i].metric(c, f"{m.sum()} פריטים", f"₪{need.loc[m, 'cost'].sum():,.0f}", delta_color="off", help=_CLS_HELP[c])
+    short = (need.status == "חסר").sum()
+    k[4].metric("עלות הדרישה", f"₪{need.cost.sum():,.0f}",
+                f"🔴 {short} חסרים · 🟡 {(need.status == 'מספיק לדרישה אחת בלבד').sum()} גבוליים", delta_color="off",
+                help="סכום העלות של כל חומרי הגלם לדרישה (מארזים × מחיר למארז). "
+                     "חסרים / גבוליים – לפי לשונית מצב המלאי.")
 
 
-def _materials(R: pd.DataFrame, targets, pinfo):
+_CLS_HELP = {
+    "ייחודי": "משמש רק את המק״טים שנבחרו (ומוצרי המשפחה שלהם) – אף מוצר אחר לא צורך אותו.",
+    "מרכזי": "משמש גם מוצרים אחרים, אבל רוב הצריכה (מעל הסף, ברירת מחדל 50%) הולכת למק״טים שנבחרו.",
+    "משותף": "משמש בעיקר מוצרים אחרים; המק״טים שנבחרו צורכים פחות ממחצית.",
+}
+
+
+def _materials(R: pd.DataFrame):
     c1, c2 = st.columns([2, 3])
-    cls = c1.pills("סיווג", ra.CLASSES, selection_mode="multi", default=ra.CLASSES, key="rm_cls")
-    only = c2.toggle("רק פריטים שנדרשים בדרישה הנוכחית", True, key="rm_only")
+    cls = c1.pills("סיווג", ra.CLASSES, selection_mode="multi", default=ra.CLASSES, key="rm_cls",
+                   help="\n\n".join(f"**{k}** – {v}" for k, v in _CLS_HELP.items()))
+    only = c2.toggle("רק פריטים שנדרשים", True, key="rm_only",
+                     help="הסתרת קודים חלופיים בעץ שאינם בשימוש בפורמולה הפעילה (כמות נדרשת 0)")
     df = R[R.cls.isin(cls or ra.CLASSES)]
     if only:
         df = df[df.req > 0]
-    bcols = {f"b_{t}": _NF(f"לאצווה {t}", format="%.3f", help=pinfo.FORMULA_DESC1.get(t, "")) for t in targets}
-    show = df.reset_index()[["item", "INGREDIENT_DESCRIPTION", "ITEM_TYPE", "cls", "share_fwd", "share_3y", "others", "ING_UOM",
-                             *bcols, "req", "pack", "packs", "price", "psrc", "cost", "vendor"]]
-    show[["share_fwd", "share_3y"]] = show[["share_fwd", "share_3y"]] * 100
-    st.dataframe(show, hide_index=True, width="stretch", height=560, column_config={
-        "item": "מק״ט", "INGREDIENT_DESCRIPTION": _TX("תיאור", width="medium"), "ITEM_TYPE": "סוג", "cls": "סיווג",
-        "share_fwd": _NF("חלק היעד – קדימה", format="%.0f%%"), "share_3y": _NF("חלק היעד – 3 שנים", format="%.0f%%"),
-        "others": _TX("צרכנים אחרים", width="medium"), "ING_UOM": "יחידה", **bcols,
-        "req": _NF("כמות נדרשת", format="%,.2f"), "pack": _NF("יחידות במארז", format="%g"),
-        "packs": _NF("מארזים", format="%,.2f"), "price": _NF("מחיר למארז", format="₪%,.2f"), "psrc": "מקור מחיר",
-        "cost": _NF("עלות", format="₪%,.0f"), "vendor": _TX("ספק", width="medium"),
+    df = df.reset_index()
+    df["share"] = df.share_fwd.where(df.req12.fillna(0) > 0, df.share_3y) * 100
+    show = df[["item", "INGREDIENT_DESCRIPTION", "cls", "share", "req", "ING_UOM", "packs", "price", "cost", "vendor"]]
+    st.dataframe(show, hide_index=True, width="stretch", height=520, column_config={
+        "item": _TX("מק״ט", help="מק״ט חומר הגלם ב-Oracle"),
+        "INGREDIENT_DESCRIPTION": _TX("תיאור", width="large", help="תיאור הפריט; גודל המארז נלקח מכאן (למשל Pack12KG)"),
+        "cls": _TX("סיווג", help=" · ".join(f"{k}: {v}" for k, v in _CLS_HELP.items())),
+        "share": _NF("% לצריכת היעד", format="%.0f%%",
+                     help="איזה חלק מהצריכה של חומר הגלם הולך למק״טים שנבחרו. לפי תכנון ASCP באופק התכנון; "
+                          "אם אין תכנון – לפי צריכה בפועל ב-3 השנים האחרונות. 100% = ייחודי."),
+        "req": _NF("כמות נדרשת", format="%,.2f",
+                   help="כמות חומר הגלם לדרישה שהוזנה (מספר אצוות × כמות לאצווה לפי עץ המוצר, כולל דרך תמיסות ובופרים). "
+                        "ביחידת העץ – ראו עמודת יחידה."),
+        "ING_UOM": _TX("יחידה", help="יחידת המידה בעץ המוצר (KG / L / PCS…)"),
+        "packs": _NF("מארזים", format="%,.2f",
+                     help="כמות נדרשת ÷ גודל מארז. מספר עשרוני = חלק ממארז; ברכישה יש לעגל למעלה."),
+        "price": _NF("מחיר למארז", format="₪%,.2f",
+                     help="מחיר שורת ה-PO האחרונה (לפי מספר PO), מומר ל-₪ לפי שער ה-PO. אם אין PO – עלות תקן. "
+                          "מספר ה-PO ומטבע המקור – בקובץ ה-Excel."),
+        "cost": _NF("עלות", format="₪%,.0f", help="מארזים × מחיר למארז"),
+        "vendor": _TX("ספק", width="medium", help="הספק ב-PO האחרון; אם אין PO – הספק המאושר (ASL)"),
     })
-    st.caption(f"{len(df)} פריטים · עלות בסינון ₪{df.cost.sum():,.0f}")
+    st.caption(f"{len(df)} פריטים · עלות ₪{df.cost.sum():,.0f}")
 
 
 def _stock(R: pd.DataFrame, short: int):
-    c1, c2 = st.columns([3, 2])
     sts = [s for s in _ICON if s in set(R.status)]
-    pick = c1.pills("סטטוס", sts, selection_mode="multi", default=[s for s in sts if s != "לא נדרש בדרישה הנוכחית"],
-                    format_func=lambda s: f"{_ICON[s]} {s}", key="rm_sts")
+    pick = st.pills("סטטוס", sts, selection_mode="multi", default=[s for s in sts if s != "לא נדרש בדרישה הנוכחית"],
+                    format_func=lambda s: f"{_ICON[s]} {s}", key="rm_sts", help=_STATUS_HELP)
     df = R[R.status.isin(pick or sts)].copy()
     df["o"] = df.status.map({s: i for i, s in enumerate(_ICON)})
     df = df.sort_values(["o", "bal"]).reset_index()
     df["status"] = df.status.map(lambda s: f"{_ICON[s]} {s}")
-    df["bal_packs"] = df.bal / df.pack
-    sm = f"{short} ח'"
-    show = df[["status", "item", "INGREDIENT_DESCRIPTION", "cls", "ING_UOM", "oh_ok", "oh_q", "oh_exp", "wo_oth", "wo_chain", "req",
-               "bal", "bal_packs", "n_more", "pl_short_oth", "po_short", "bal_short", "po_next", "exp_min", "exp_short", "notes"]]
-    st.dataframe(show, hide_index=True, width="stretch", height=560, column_config={
-        "status": _TX("סטטוס", width="medium"), "item": "מק״ט", "INGREDIENT_DESCRIPTION": _TX("תיאור", width="medium"),
-        "cls": "סיווג", "ING_UOM": "יחידה",
-        "oh_ok": _NF("מלאי מאושר בתוקף", format="%,.2f"), "oh_q": _NF("בהסגר", format="%,.2f"),
-        "oh_exp": _NF("פג תוקף", format="%,.2f", help="לא נספר במלאי"),
-        "wo_oth": _NF("WO פתוחים – אחרים", format="%,.2f", help="יתרת הזמנות עבודה פתוחות של מוצרים אחרים"),
-        "wo_chain": _NF("WO פתוחים – היעד", format="%,.2f", help="יתרת הזמנות עבודה פתוחות של המק״טים הנבחרים (הייצור הנוכחי)"),
-        "req": _NF("דרישה", format="%,.2f"),
-        "bal": _NF("יתרה אחרי ייצור קיים ודרישה", format="%,.2f"), "bal_packs": _NF("יתרה במארזים", format="%,.2f"),
-        "n_more": _NF("מספיק לכמה דרישות", format="%.1f"),
-        "pl_short_oth": _NF(f"ביקוש מתוכנן אחרים – {sm}", format="%,.2f"), "po_short": _NF(f"PO עד {sm}", format="%,.2f"),
-        "bal_short": _NF(f"יתרה צפויה {sm}", format="%,.2f"),
-        "po_next": st.column_config.DateColumn("PO הבא", format="DD/MM/YYYY"),
-        "exp_min": st.column_config.DateColumn("תפוגה קרובה", format="DD/MM/YYYY"),
-        "exp_short": _NF(f"יפוג תוך {sm}", format="%,.2f"), "notes": _TX("הערה", width="large"),
+    df["reserved"] = df.wo_oth + df.wo_chain
+    show = df[["status", "item", "INGREDIENT_DESCRIPTION", "ING_UOM", "oh_ok", "reserved", "req", "bal", "n_more",
+               "bal_short", "po_next", "notes"]]
+    st.dataframe(show, hide_index=True, width="stretch", height=520, column_config={
+        "status": _TX("מצב", width="medium", help=_STATUS_HELP),
+        "item": _TX("מק״ט", help="מק״ט חומר הגלם ב-Oracle"),
+        "INGREDIENT_DESCRIPTION": _TX("תיאור", width="medium"),
+        "ING_UOM": _TX("יחידה", help="כל הכמויות בטבלה ביחידת העץ (KG / L / PCS…), לא במארזים"),
+        "oh_ok": _NF("מלאי זמין", format="%,.2f",
+                     help="מלאי ב-Oracle (ארגון EM) בסטטוס מאושר ובתוקף. לא כולל הסגר ואצוות שפג תוקפן – הן מופיעות בהערות."),
+        "reserved": _NF("שמור לייצור פתוח", format="%,.2f",
+                        help="יתרה שטרם הונפקה בהזמנות עבודה פתוחות ב-ASCP – של כל המוצרים, "
+                             "כולל הזמנות פתוחות של המק״טים שנבחרו (הקמפיין הנוכחי)."),
+        "req": _NF("נדרש", format="%,.2f", help="הכמות לדרישה שהוזנה – בנוסף לייצור הפתוח"),
+        "bal": _NF("יתרה", format="%,.2f",
+                   help="מלאי זמין − שמור לייצור פתוח − נדרש. שלילי = חסר היום."),
+        "n_more": _NF("מספיק ל-X דרישות", format="%.1f",
+                      help="כמה דרישות כאלה המלאי מכסה אחרי הייצור הפתוח. 1.0–2.0 = מספיק לדרישה אחת בלבד."),
+        "bal_short": _NF(f"יתרה צפויה ({short} ח')", format="%,.2f",
+                         help=f"היתרה בעוד {short} חודשים: + PO פתוחים (כולל דרישות רכש ומשלוחים בדרך) "
+                              f"− ביקוש מתוכנן ותחזית של מוצרים אחרים ב-ASCP. שלילי = צפוי חוסר."),
+        "po_next": st.column_config.DateColumn("PO הבא", format="DD/MM/YYYY",
+                                               help="תאריך האספקה הקרוב של PO / דרישת רכש פתוחה ב-ASCP"),
+        "notes": _TX("הערות", width="large",
+                     help="פג תוקף, הסגר, תפוגה קרובה, PO ורכש מתוכנן ב-ASCP, ייצור מתוכנן נוסף של היעד, "
+                          "וקודים חלופיים בעץ עם מלאי. לחיצה כפולה על תא מציגה את הטקסט המלא."),
     })
-    with st.container(key="rm_rtl_stock"):
-        st.caption("יתרה = מלאי מאושר בתוקף − הזמנות עבודה פתוחות (כולל של היעד) − הדרישה. "
-                   f"יתרה צפויה {sm} = יתרה − ביקוש מתוכנן של מוצרים אחרים + PO פתוחים, עד {sm}. כל הכמויות ביחידת העץ.")
+
+
+_STATUS_HELP = ("🔴 **חסר** – אין מספיק מלאי לדרישה אחרי הייצור הפתוח.  \n"
+                "🟠 **חסר תוך הטווח הקצר** – יש היום, אבל לפי ביקוש מתוכנן ו-PO צפוי חוסר.  \n"
+                "🟡 **מספיק לדרישה אחת בלבד** – אחרי הדרישה נשאר פחות מדרישה נוספת.  \n"
+                "🟢 **תקין** – מספיק לפחות לשתי דרישות.  \n"
+                "⚪ **לא נדרש** – קוד חלופי בעץ, לא בשימוש בפורמולה הפעילה.")
 
 
 def _methodology():
@@ -159,7 +194,8 @@ def render_rm_analysis():
         st.session_state.rm_applied = pending
     changed = pending != st.session_state.rm_applied
     c1, c2 = st.columns([1, 4])
-    if c1.button("✅ Apply", key="rm_apply", type="primary", disabled=not changed, width="stretch"):
+    if c1.button("✅ Apply", key="rm_apply", type="primary", disabled=not changed, width="stretch",
+                 help="חישוב הטבלאות מחדש לפי המק״טים, האצוות וההגדרות שהוזנו"):
         st.session_state.rm_applied = pending
         st.rerun()
     if changed:
@@ -182,11 +218,12 @@ def render_rm_analysis():
                    + ", ".join(f"{batches[t]:g} × {t}" for t in targets))
     tabs = st.tabs(["📋 חומרי גלם, כמויות ומחירים", "📦 מצב מלאי מול הייצור הקיים"])
     with tabs[0]:
-        _materials(R, targets, pinfo)
+        _materials(R)
     with tabs[1]:
         _stock(R, short)
 
     xl = ra.build_workbook(R, targets, pinfo, batches, short)
     st.download_button("📥 הורדה ל-Excel (עם נוסחאות)", data=xl, file_name=f"RM_analysis_{'_'.join(targets)}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rm_dl")
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rm_dl",
+                       help="קובץ עם שני גיליונות ונוסחאות חיות: כל העמודות המלאות (כמות לאצווה לכל מק״ט, מקור מחיר, הסגר, תפוגה, PO), ותאים צהובים לשינוי מספר האצוות")
     _methodology()

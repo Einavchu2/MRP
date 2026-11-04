@@ -48,14 +48,21 @@ def product_info(bom: pd.DataFrame) -> pd.DataFrame:
     return bom.drop_duplicates("PRODUCT").set_index("PRODUCT")[["FORMULA_DESC1", "PQ", "PRODUCT_UOM"]]
 
 
+# Abbreviations used as the first word of related formulas' descriptions
+# ("AP - Periodic column sampling" belongs to the Aminopeptidase family).
+_ALIASES = {"aminopeptidase": {"ap"}}
+
+
 def suggest_family(bom: pd.DataFrame, targets) -> list:
     """Other top-level products of the same family (description starts with
-    the same word as a target's), e.g. the weekly seeding that also uses the
-    Aminopeptidase WCB."""
+    the same word as a target's, or a known abbreviation of it), e.g. the
+    weekly seeding that also uses the Aminopeptidase WCB."""
     desc = product_info(bom).FORMULA_DESC1
     words = {_stem(desc.get(t)) for t in targets} - {""}
+    words |= {a for w in words for a in _ALIASES.get(w, ())}
+    first = lambda d: (re.split(r"[\s(/,-]+", str(d or "").strip().lower()) or [""])[0]
     roots = set(bom.PRODUCT) - set(bom.INGREDIENT) - set(targets)
-    return sorted(r for r in roots if _stem(desc.get(r)) in words)
+    return sorted(r for r in roots if first(desc.get(r)) in words)
 
 
 def _reach(kids: dict, starts, block=frozenset()) -> set:
@@ -318,7 +325,7 @@ def _fmt(v, u=""):
 
 
 def _notes(R: pd.DataFrame, today) -> pd.Series:
-    """Automatic remarks: expired stock, open/planned POs on shortages,
+    """Automatic remarks: expired, quarantined and soon-expiring stock, open/planned POs on shortages,
     stock tied to the targets' open orders, and in-tree alternative codes
     (same description stem, not used in the current requirement) that hold stock."""
     alt = R[(R.req <= 0) & ((R.oh_ok + R.oh_q) > 0)].copy()
@@ -328,6 +335,10 @@ def _notes(R: pd.DataFrame, today) -> pd.Series:
         u, n = r.ING_UOM, []
         if r.oh_exp > 0:
             n.append(f"{_fmt(r.oh_exp, u)} פג תוקף – לא נספרו")
+        if r.req > 0 and r.oh_q > 0:
+            n.append(f"{_fmt(r.oh_q, u)} בהסגר – לא נספרו")
+        if r.req > 0 and r.exp_short > 0:
+            n.append(f"{_fmt(r.exp_short, u)} יפוגו בטווח הקצר (ראשון ב-{r.exp_min:%d/%m/%Y})")
         if r.req > 0 and r.status != "תקין":
             if r.wo_chain > 0 and r.oh_ok - r.wo_oth - r.wo_chain <= 1e-9:
                 n.append("כל המלאי משויך להזמנות העבודה הפתוחות של היעד")
