@@ -17,3 +17,10 @@ venv/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Runtime logs / monitoring output / editor settings
+*.log
+.vscode/
+monitoring/reports/
+monitoring/state/
+monitoring/alerts/
